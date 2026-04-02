@@ -1530,6 +1530,16 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    @staticmethod
+    def _mark_no_response_expected(event: MessageEvent, reason: str) -> None:
+        """Mark an event as intentionally producing no direct text response."""
+        try:
+            event.no_response_expected = True
+            event.no_response_reason = reason
+        except Exception:
+            # Non-fatal: best-effort telemetry marker only.
+            pass
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -1573,6 +1583,7 @@ class GatewayRunner:
                             "Too many pairing requests right now~ "
                             "Please try again later!"
                         )
+            self._mark_no_response_expected(event, "unauthorized user handled by pairing/ignore flow")
             return None
         
         # PRIORITY handling when an agent is already running for this session.
@@ -1669,6 +1680,7 @@ class GatewayRunner:
                             adapter._pending_messages[_quick_key] = event
                     else:
                         adapter._pending_messages[_quick_key] = event
+                self._mark_no_response_expected(event, "photo follow-up queued while agent is running")
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
@@ -1685,6 +1697,7 @@ class GatewayRunner:
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     adapter._pending_messages[_quick_key] = event
+                self._mark_no_response_expected(event, "message queued while agent startup sentinel is active")
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
@@ -1692,6 +1705,7 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
                 self._pending_messages[_quick_key] = event.text
+            self._mark_no_response_expected(event, "message used as interrupt/input merge for running agent")
             return None
 
         # Check for commands
@@ -1733,6 +1747,9 @@ class GatewayRunner:
 
         if canonical == "provider":
             return await self._handle_provider_command(event)
+
+        if canonical == "model":
+            return await self._handle_model_command(event)
         
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -2692,6 +2709,7 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                self._mark_no_response_expected(event, "response already streamed to platform")
                 return None
 
             return response
@@ -3018,6 +3036,74 @@ class GatewayRunner:
         lines.append("Setup: `hermes setup`")
         return "\n".join(lines)
     
+    async def _handle_model_command(self, event: MessageEvent) -> str:
+        """Handle /model command - show or switch model/provider."""
+        import yaml
+        from hermes_cli.model_switch import switch_model, switch_to_custom_provider
+
+        args = event.get_command_args().strip()
+        if not args:
+            info = self._format_session_info()
+            return (
+                f"{info}\n\n"
+                "Usage: `/model <model>` or `/model provider:model`\n"
+                "Example: `/model gpt-5.4`"
+            )
+
+        config_path = _hermes_home / "config.yaml"
+        config = _load_gateway_config()
+        model_cfg = config.get("model")
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+            config["model"] = model_cfg
+
+        if args.lower() == "custom":
+            custom_result = switch_to_custom_provider()
+            if not custom_result.success:
+                return f"⚠️ {custom_result.error_message}"
+            target_provider = "custom"
+            new_model = custom_result.model
+            base_url = custom_result.base_url
+            warning_message = ""
+        else:
+            current_provider = str(model_cfg.get("provider") or "openrouter")
+            result = switch_model(
+                raw_input=args,
+                current_provider=current_provider,
+                current_base_url=str(model_cfg.get("base_url") or ""),
+                current_api_key="",
+            )
+            if not result.success:
+                return f"⚠️ {result.error_message}"
+            target_provider = result.target_provider or current_provider
+            new_model = result.new_model
+            base_url = result.base_url
+            warning_message = result.warning_message or ""
+
+        model_cfg["provider"] = target_provider
+        model_cfg["default"] = new_model
+        if target_provider == "custom" and base_url:
+            model_cfg["base_url"] = base_url
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        except Exception as e:
+            return f"⚠️ Failed to save model config: {e}"
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        self._evict_cached_agent(session_entry.session_key)
+        _fallback_routes = getattr(self, "_session_fallback_routes", None)
+        if isinstance(_fallback_routes, dict):
+            _fallback_routes.pop(session_entry.session_key, None)
+
+        warning_block = f"\n⚠️ {warning_message}" if warning_message else ""
+        return (
+            f"✅ Switched to `{new_model}` via `{target_provider}`.{warning_block}\n"
+            "Starts on your next message in this chat."
+        )
+
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         import yaml

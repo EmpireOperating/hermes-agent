@@ -160,6 +160,20 @@ class TestContextPressureFlags:
         assert args[0] == "context_pressure"
         assert "85% to compaction" in args[1]
 
+    def test_emit_suppresses_telegram_gateway_message(self, agent):
+        """Telegram platform should not receive context pressure chat telemetry."""
+        cb = MagicMock()
+        agent.status_callback = cb
+        agent.platform = "telegram"
+
+        compressor = MagicMock()
+        compressor.context_length = 200_000
+        compressor.threshold_tokens = 100_000
+
+        agent._emit_context_pressure(0.85, compressor)
+
+        cb.assert_not_called()
+
     def test_emit_no_callback_no_crash(self, agent):
         """No status_callback set — should not crash."""
         agent.status_callback = None

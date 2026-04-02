@@ -319,6 +319,11 @@ class MessageEvent:
     
     # Auto-loaded skill for topic/channel bindings (e.g., Telegram DM Topics)
     auto_skill: Optional[str] = None
+
+    # Handler may intentionally return no direct text response for this event
+    # (e.g., streaming already delivered, message queued while agent running).
+    no_response_expected: bool = False
+    no_response_reason: Optional[str] = None
     
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -405,6 +410,9 @@ class BasePlatformAdapter(ABC):
         self._background_tasks: set[asyncio.Task] = set()
         # Chats where auto-TTS on voice input is disabled (set by /voice off)
         self._auto_tts_disabled_chats: set = set()
+        # Telemetry for unexpected empty handler responses (best-effort diagnostics).
+        self._unexpected_empty_response_total: int = 0
+        self._unexpected_empty_response_by_session: Dict[str, int] = {}
 
     @property
     def has_fatal_error(self) -> bool:
@@ -1032,6 +1040,29 @@ class BasePlatformAdapter(ABC):
             min_ms, max_ms = 800, 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    def _record_unexpected_empty_response(self, event: MessageEvent, session_key: str) -> tuple[int, int]:
+        """Record telemetry for an unexpected empty handler response."""
+        total = self._unexpected_empty_response_total + 1
+        self._unexpected_empty_response_total = total
+        session_total = self._unexpected_empty_response_by_session.get(session_key, 0) + 1
+        self._unexpected_empty_response_by_session[session_key] = session_total
+        try:
+            logger.warning(
+                "[%s] unexpected_empty_handler_response platform=%s chat_id=%s thread_id=%s message_id=%s session_key=%s total=%d session_total=%d",
+                self.name,
+                self.platform.value,
+                event.source.chat_id if event.source else "",
+                event.source.thread_id if event.source else "",
+                event.message_id,
+                session_key,
+                total,
+                session_total,
+            )
+        except Exception:
+            # Best-effort telemetry only.
+            pass
+        return total, session_total
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Create interrupt event for this session
@@ -1048,7 +1079,25 @@ class BasePlatformAdapter(ABC):
             
             # Send response if any
             if not response:
-                logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+                _no_response_expected = bool(getattr(event, "no_response_expected", False))
+                _no_response_reason = getattr(event, "no_response_reason", "")
+                if _no_response_expected:
+                    logger.debug(
+                        "[%s] Handler returned no direct response for %s (expected%s)",
+                        self.name,
+                        event.source.chat_id,
+                        f": {_no_response_reason}" if _no_response_reason else "",
+                    )
+                else:
+                    self._record_unexpected_empty_response(event, session_key)
+                    # Defensive fallback: avoid silent drops when handler unexpectedly
+                    # yields no text. Keep brief and user-actionable.
+                    await self._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content="⚠️ I hit a transient delivery issue and returned an empty response. Please resend your last message.",
+                        reply_to=event.message_id,
+                        metadata=_thread_metadata,
+                    )
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)

@@ -5576,7 +5576,9 @@ class AIAgent:
             self._safe_print(line)
 
         # Gateway / external consumers
-        if self.status_callback:
+        # Telegram chats are message-dense; suppress context-pressure telemetry there
+        # while still keeping compaction behavior/logging unchanged.
+        if self.status_callback and self.platform != "telegram":
             try:
                 msg = format_context_pressure_gateway(
                     compaction_progress=compaction_progress,

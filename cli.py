@@ -3110,6 +3110,61 @@ class HermesCLI:
         remaining = len(self.conversation_history)
         print(f"  {remaining} message(s) remaining in history.")
     
+    def _handle_model_command(self, cmd: str) -> None:
+        """Handle /model command for quick in-session model switching."""
+        from hermes_cli.model_switch import switch_model, switch_to_custom_provider
+
+        parts = cmd.split(maxsplit=1)
+        if len(parts) == 1 or not parts[1].strip():
+            self._show_model_and_providers()
+            print("  Usage: /model <model> or /model provider:model")
+            print("  Example: /model gpt-5.4")
+            return
+
+        raw_input = parts[1].strip()
+
+        if raw_input.lower() == "custom":
+            custom_result = switch_to_custom_provider()
+            if not custom_result.success:
+                print(f"  ⚠️  {custom_result.error_message}")
+                return
+            target_provider = "custom"
+            new_model = custom_result.model
+            base_url = custom_result.base_url
+        else:
+            result = switch_model(
+                raw_input=raw_input,
+                current_provider=(self.requested_provider or self.provider or "openrouter"),
+                current_base_url=(self.base_url or self._explicit_base_url or ""),
+                current_api_key=(self.api_key or self._explicit_api_key or ""),
+            )
+            if not result.success:
+                print(f"  ⚠️  {result.error_message}")
+                return
+            target_provider = result.target_provider or (self.requested_provider or self.provider or "openrouter")
+            new_model = result.new_model
+            base_url = result.base_url
+            if result.warning_message:
+                print(f"  ⚠️  {result.warning_message}")
+
+        self.requested_provider = target_provider
+        self.provider = target_provider
+        self.model = new_model
+        if base_url:
+            self.base_url = base_url
+
+        # Force re-init on next turn so prompt/tool cache and auth route are rebuilt safely.
+        self.agent = None
+        self._active_agent_route_signature = None
+
+        _saved_provider = save_config_value("model.provider", target_provider)
+        _saved_model = save_config_value("model.default", new_model)
+        if target_provider == "custom" and base_url:
+            save_config_value("model.base_url", base_url)
+
+        provider_saved_msg = "saved" if _saved_provider and _saved_model else "session only"
+        print(f"  ✅ Switched to {new_model} via {target_provider} ({provider_saved_msg})")
+
     def _show_model_and_providers(self):
         """Show current model + provider and list all authenticated providers.
 
@@ -3747,6 +3802,8 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
+        elif canonical == "model":
+            self._handle_model_command(cmd_original)
         elif canonical == "prompt":
             # Use original case so prompt text isn't lowercased
             self._handle_prompt_command(cmd_original)

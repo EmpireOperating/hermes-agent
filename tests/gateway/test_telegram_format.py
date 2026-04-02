@@ -255,6 +255,15 @@ class TestFormatMessageLinks:
         result = adapter.format_message("[Click here](https://example.com)")
         assert "[Click here](https://example.com)" in result
 
+    def test_bare_url_converted_to_explicit_markdown_link(self, adapter):
+        result = adapter.format_message("https://app.cronpulse.app/app")
+        assert "[https://app\\.cronpulse\\.app/app](https://app.cronpulse.app/app)" in result
+
+    def test_bare_url_with_trailing_period_keeps_period_outside_link(self, adapter):
+        result = adapter.format_message("Visit https://example.com/path.")
+        assert "[https://example\\.com/path](https://example.com/path)" in result
+        assert result.endswith(".") or "\\." in result
+
     def test_link_display_text_escaped(self, adapter):
         result = adapter.format_message("[Hello!](https://example.com)")
         # The ! in display text should be escaped

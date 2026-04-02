@@ -133,3 +133,62 @@ class TestBasePlatformTopicSessions:
                 "metadata": {"thread_id": "17585"},
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_sends_fallback_on_unexpected_empty_response(self, caplog):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return None
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        session_key = build_session_key(event.source)
+        with caplog.at_level("WARNING"):
+            await adapter._process_message_background(event, session_key)
+
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "⚠️ I hit a transient delivery issue and returned an empty response. Please resend your last message.",
+                "reply_to": "1",
+                "metadata": {"thread_id": "17585"},
+            }
+        ]
+        assert adapter._unexpected_empty_response_total == 1
+        assert adapter._unexpected_empty_response_by_session == {session_key: 1}
+        assert any(
+            "unexpected_empty_handler_response" in rec.message
+            and "chat_id=-1001" in rec.message
+            and f"session_key={session_key}" in rec.message
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_no_fallback_when_empty_response_expected(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(evt):
+            await asyncio.sleep(0)
+            evt.no_response_expected = True
+            evt.no_response_reason = "response already streamed"
+            return None
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == []
+        assert adapter._unexpected_empty_response_total == 0
+        assert adapter._unexpected_empty_response_by_session == {}
