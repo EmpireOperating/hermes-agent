@@ -173,8 +173,19 @@ class TestValidateFilePath:
 
 
 # ---------------------------------------------------------------------------
-# CRUD operations
+# Lookup / CRUD operations
 # ---------------------------------------------------------------------------
+
+
+class TestFindSkill:
+    def test_find_skill_respects_patched_skills_dir(self, tmp_path):
+        with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _find_skill("my-skill")
+
+        assert result is not None
+        assert result["path"] == tmp_path / "my-skill"
+        assert result["skills_dir"] == tmp_path
 
 
 class TestCreateSkill:

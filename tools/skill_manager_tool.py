@@ -201,21 +201,42 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return SKILLS_DIR / name
 
 
+def _get_all_skill_dirs() -> list[Path]:
+    """Return search roots for skill lookup.
+
+    Uses the module's effective local ``SKILLS_DIR`` as the primary source of
+    truth so tests can safely patch it. External skill directories still come
+    from config via ``agent.skill_utils``.
+    """
+    from agent.skill_utils import get_external_skills_dirs
+
+    dirs = [SKILLS_DIR]
+    seen = {SKILLS_DIR.resolve()}
+
+    for skills_dir in get_external_skills_dirs():
+        resolved = skills_dir.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        dirs.append(skills_dir)
+
+    return dirs
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
 
     Searches the local skills dir (~/.hermes/skills/) first, then any
     external dirs configured via skills.external_dirs.  Returns
-    {"path": Path} or None.
+    {"path": Path, "skills_dir": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs
-    for skills_dir in get_all_skills_dirs():
+    for skills_dir in _get_all_skill_dirs():
         if not skills_dir.exists():
             continue
         for skill_md in skills_dir.rglob("SKILL.md"):
             if skill_md.parent.name == name:
-                return {"path": skill_md.parent}
+                return {"path": skill_md.parent, "skills_dir": skills_dir}
     return None
 
 
@@ -466,9 +487,10 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     skill_dir = existing["path"]
     shutil.rmtree(skill_dir)
 
-    # Clean up empty category directories (don't remove SKILLS_DIR itself)
+    # Clean up empty category directories (don't remove the skills root itself)
     parent = skill_dir.parent
-    if parent != SKILLS_DIR and parent.exists() and not any(parent.iterdir()):
+    skills_root = existing.get("skills_dir", SKILLS_DIR)
+    if parent != skills_root and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
     return {
