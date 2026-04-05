@@ -739,8 +739,16 @@ class MatrixAdapter(BasePlatformAdapter):
             msg_content["m.relates_to"] = relates_to
 
         resp2 = await self._client.room_send(room_id, "m.room.message", msg_content)
-        if isinstance(resp2, nio.RoomSendResponse):
-            return SendResult(success=True, message_id=resp2.event_id)
+        event_id = getattr(resp2, "event_id", None)
+        try:
+            send_ok = isinstance(resp2, nio.RoomSendResponse)
+        except TypeError:
+            # Some environments/tests can expose a non-type RoomSendResponse symbol.
+            # Fall back to the success payload returned by room_send().
+            send_ok = bool(event_id)
+
+        if send_ok:
+            return SendResult(success=True, message_id=event_id)
         return SendResult(success=False, error=getattr(resp2, "message", str(resp2)))
 
     async def _send_local_file(
