@@ -350,3 +350,13 @@ class TestMatrixSendVoiceMSC3245:
 
         assert sent_content["url"] == "mxc://example.org/uploaded"
         assert "org.matrix.msc3245.voice" in sent_content
+
+    @pytest.mark.asyncio
+    async def test_send_voice_tolerates_non_type_roomsendresponse_symbol(self, monkeypatch):
+        """send_voice should fall back to event_id when nio.RoomSendResponse is not a type."""
+        monkeypatch.setattr(nio, "RoomSendResponse", object())
+
+        sent_content = await self._send_voice_and_capture_content()
+
+        assert sent_content["url"] == "mxc://example.org/uploaded"
+        assert "org.matrix.msc3245.voice" in sent_content
