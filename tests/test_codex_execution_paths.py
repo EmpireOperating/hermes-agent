@@ -135,9 +135,10 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
             "provider": "openai-codex",
             "api_mode": "codex_responses",
             "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-token",
+            "api_key": "***",
         },
     )
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
     monkeypatch.setenv("HERMES_MODEL", "gpt-5.3-codex")
 
@@ -181,3 +182,11 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.refresh_attempts == 1
     assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+
+
+def test_resolve_gateway_model_falls_back_to_env(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setenv("HERMES_MODEL", "gpt-5.3-codex")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    assert gateway_run._resolve_gateway_model() == "gpt-5.3-codex"
