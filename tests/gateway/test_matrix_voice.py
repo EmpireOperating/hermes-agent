@@ -301,21 +301,17 @@ class TestMatrixSendVoiceMSC3245:
 
         self.adapter._client.upload = mock_upload
 
-    @pytest.mark.asyncio
-    async def test_send_voice_includes_msc3245_field(self):
-        """send_voice should include org.matrix.msc3245.voice in message content."""
-        import tempfile
+    async def _send_voice_and_capture_content(self, monkeypatch=None):
         import os
-        
-        # Create a temp audio file
+        import tempfile
+
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
             f.write(b"fake audio data")
             temp_path = f.name
-        
+
         try:
-            # Capture the message content sent to room_send
             sent_content = None
-            
+
             async def mock_room_send(room_id, event_type, content):
                 nonlocal sent_content
                 sent_content = content
@@ -324,25 +320,41 @@ class TestMatrixSendVoiceMSC3245:
                 import nio
                 resp.__class__ = nio.RoomSendResponse
                 return resp
-            
+
             self.adapter._client.room_send = mock_room_send
-            
+
             await self.adapter.send_voice(
                 chat_id="!room:example.org",
                 audio_path=temp_path,
                 caption="Test voice",
             )
-            
+
             assert sent_content is not None, "No message was sent"
-            assert "org.matrix.msc3245.voice" in sent_content, \
-                f"MSC3245 voice field missing from content: {sent_content.keys()}"
-            assert sent_content["msgtype"] == "m.audio"
-            assert sent_content["info"]["mimetype"] == "audio/ogg"
             assert self.upload_call is not None, "Expected upload() to be called"
             args, kwargs = self.upload_call
             assert isinstance(args[0], io.BytesIO)
             assert kwargs["content_type"] == "audio/ogg"
             assert kwargs["filename"].endswith(".ogg")
-
+            return sent_content
         finally:
             os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_includes_msc3245_field(self):
+        """send_voice should include org.matrix.msc3245.voice in message content."""
+        sent_content = await self._send_voice_and_capture_content()
+
+        assert "org.matrix.msc3245.voice" in sent_content, \
+            f"MSC3245 voice field missing from content: {sent_content.keys()}"
+        assert sent_content["msgtype"] == "m.audio"
+        assert sent_content["info"]["mimetype"] == "audio/ogg"
+
+    @pytest.mark.asyncio
+    async def test_send_voice_tolerates_non_type_uploadresponse_symbol(self, monkeypatch):
+        """send_voice should fall back to content_uri when nio.UploadResponse is not a type."""
+        monkeypatch.setattr(nio, "UploadResponse", object())
+
+        sent_content = await self._send_voice_and_capture_content()
+
+        assert sent_content["url"] == "mxc://example.org/uploaded"
+        assert "org.matrix.msc3245.voice" in sent_content

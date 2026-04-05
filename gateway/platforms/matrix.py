@@ -697,12 +697,18 @@ class MatrixAdapter(BasePlatformAdapter):
             filename=filename,
             filesize=len(data),
         )
-        if not isinstance(resp, nio.UploadResponse):
+        mxc_url = getattr(resp, "content_uri", None)
+        try:
+            upload_ok = isinstance(resp, nio.UploadResponse)
+        except TypeError:
+            # Some environments/tests can expose a non-type UploadResponse symbol.
+            # Fall back to the actual success payload we need from upload().
+            upload_ok = bool(mxc_url)
+
+        if not upload_ok:
             err = getattr(resp, "message", str(resp))
             logger.error("Matrix: upload failed: %s", err)
             return SendResult(success=False, error=err)
-
-        mxc_url = resp.content_uri
 
         # Build media message content.
         msg_content: Dict[str, Any] = {
