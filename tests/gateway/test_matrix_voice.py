@@ -14,6 +14,8 @@ try:
 except ImportError:
     pytest.skip("matrix-nio not installed", allow_module_level=True)
 
+nio = _nio_probe
+
 from gateway.platforms.base import MessageType
 
 
