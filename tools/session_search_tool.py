@@ -258,7 +258,15 @@ def session_search(
     The current session is excluded from results since the agent already has that context.
     """
     if db is None:
-        return tool_error("Session database not available.", success=False)
+        # Defensive fallback: some runtimes may fail to inject session_db even
+        # when the default Hermes state DB is available.
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+        except Exception as e:
+            logging.warning("Session search DB unavailable: %s", e)
+            return tool_error("Session database not available.", success=False)
 
     limit = min(limit, 5)  # Cap at 5 sessions to avoid excessive LLM calls
 

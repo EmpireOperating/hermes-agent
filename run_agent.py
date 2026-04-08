@@ -6635,7 +6635,7 @@ class AIAgent:
             self._safe_print(line)
 
         # Gateway / external consumers
-        if self.status_callback:
+        if self.status_callback and self.platform != "telegram":
             try:
                 msg = format_context_pressure_gateway(
                     compaction_progress=compaction_progress,

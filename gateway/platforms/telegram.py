@@ -1825,6 +1825,23 @@ class TelegramAdapter(BasePlatformAdapter):
 
         text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _convert_link, text)
 
+        # 3.5) Convert bare URLs into explicit markdown links so MarkdownV2
+        # escaping does not break Telegram auto-linking.
+        def _convert_bare_url(m):
+            raw_url = m.group(1)
+            trailing = ""
+            while raw_url and raw_url[-1] in ".,!?;:":
+                trailing = raw_url[-1] + trailing
+                raw_url = raw_url[:-1]
+            if not raw_url:
+                return m.group(1)
+            display = _escape_mdv2(raw_url)
+            url = raw_url.replace('\\', '\\\\').replace(')', '\\)')
+            trailing_escaped = _escape_mdv2(trailing) if trailing else ""
+            return _ph(f'[{display}]({url})') + trailing_escaped
+
+        text = re.sub(r'(https?://[^\s<]+)', _convert_bare_url, text)
+
         # 4) Convert markdown headers (## Title) → bold *Title*
         def _convert_header(m):
             inner = m.group(1).strip()
