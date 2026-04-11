@@ -1100,6 +1100,14 @@ class AIAgent:
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
+        # Visible text that was already streamed to the user during the current
+        # API attempt. Lets us salvage a response if the provider later returns a
+        # malformed final object after successful text delivery.
+        self._streamed_visible_text_parts: List[str] = []
+        # Track whether the current streamed attempt observed tool call deltas.
+        # Text salvage is only safe for pure text turns; if tool calls were seen,
+        # a malformed final response must not be converted into a completed answer.
+        self._streamed_visible_text_had_tool_calls = False
         # Deferred paragraph break flag — set after tool iterations so a
         # single "\n\n" is prepended to the next real text delta.
         self._stream_needs_break = False
@@ -5519,6 +5527,13 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
+    def _reset_streamed_visible_text(self) -> None:
+        self._streamed_visible_text_parts = []
+        self._streamed_visible_text_had_tool_calls = False
+
+    def _get_streamed_visible_text(self) -> str:
+        return "".join(getattr(self, "_streamed_visible_text_parts", [])).strip()
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
         # If a tool iteration set the break flag, prepend a single paragraph
@@ -5528,6 +5543,8 @@ class AIAgent:
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
+        if isinstance(text, str) and text:
+            self._streamed_visible_text_parts.append(text)
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -5795,6 +5812,7 @@ class AIAgent:
 
                 # Accumulate tool call deltas — notify display on first name
                 if delta and delta.tool_calls:
+                    self._streamed_visible_text_had_tool_calls = True
                     for tc_delta in delta.tool_calls:
                         raw_idx = tc_delta.index if tc_delta.index is not None else 0
                         delta_id = tc_delta.id or ""
@@ -8787,6 +8805,7 @@ class AIAgent:
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
+        self._reset_streamed_visible_text()
         self._persist_user_message_idx = None
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
@@ -9497,6 +9516,7 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
+                    self._reset_streamed_visible_text()
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(
                             api_kwargs, on_first_delta=_stop_spinner
@@ -9590,11 +9610,43 @@ class AIAgent:
                             thinking_spinner = None
                         if self.thinking_callback:
                             self.thinking_callback("")
-                        
+
                         # Invalid response — could be rate limiting, provider timeout,
                         # upstream server error, or malformed response.
+                        streamed_visible_text = self._get_streamed_visible_text()
+                        streamed_turn_had_tool_calls = getattr(
+                            self, "_streamed_visible_text_had_tool_calls", False
+                        )
+                        if (
+                            self.api_mode == "chat_completions"
+                            and streamed_visible_text
+                            and not streamed_turn_had_tool_calls
+                        ):
+                            logger.warning(
+                                "Salvaging malformed chat_completions final response from %d streamed chars.",
+                                len(streamed_visible_text),
+                            )
+                            response = SimpleNamespace(
+                                choices=[
+                                    SimpleNamespace(
+                                        message=SimpleNamespace(
+                                            role="assistant",
+                                            content=streamed_visible_text,
+                                            tool_calls=None,
+                                            reasoning_content=None,
+                                        ),
+                                        finish_reason="stop",
+                                    )
+                                ],
+                                model=getattr(response, "model", None) if response is not None else None,
+                                usage=getattr(response, "usage", None) if response is not None else None,
+                            )
+                            response_invalid = False
+
+                    if response_invalid:
+                        # This is often rate limiting or provider returning malformed response
                         retry_count += 1
-                        
+
                         # Eager fallback: empty/malformed responses are a common
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
@@ -9616,18 +9668,18 @@ class AIAgent:
                                 provider_name = response.error.metadata.get('provider_name', 'Unknown')
                         elif response and hasattr(response, 'message') and response.message:
                             error_msg = str(response.message)
-                        
+
                         # Try to get provider from model field (OpenRouter often returns actual model used)
                         if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
                             provider_name = f"model={response.model}"
-                        
+
                         # Check for x-openrouter-provider or similar metadata
                         if provider_name == "Unknown" and response:
                             # Log all response attributes for debugging
                             resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
                             if self.verbose_logging:
                                 logging.debug(f"Response attributes for invalid response: {resp_attrs}")
-                        
+
                         # Extract error code from response for contextual diagnostics
                         _resp_error_code = None
                         if response and hasattr(response, 'error') and response.error:

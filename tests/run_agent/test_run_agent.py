@@ -2116,6 +2116,60 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_streamed_text_salvaged_when_final_response_is_malformed(self, agent):
+        """If streaming already produced visible text, don't retry and duplicate it."""
+        self._setup_agent(agent)
+        deltas = []
+        agent.stream_delta_callback = lambda text: deltas.append(text)
+
+        def _bad_streaming_call(_api_kwargs, on_first_delta=None):
+            if on_first_delta:
+                on_first_delta()
+            agent._fire_stream_delta("Good morning! How can I help today?")
+            return SimpleNamespace(choices=[], model="test/model", usage=None)
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_streaming_api_call", side_effect=_bad_streaming_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "Good morning! How can I help today?"
+        assert deltas == ["Good morning! How can I help today?"]
+
+    def test_streamed_text_not_salvaged_when_tool_calls_were_seen(self, agent):
+        """A malformed final response must not turn a tool turn into a completed text answer."""
+        self._setup_agent(agent)
+        deltas = []
+        agent.stream_delta_callback = lambda text: deltas.append(text)
+        agent._fallback_chain = []
+
+        def _bad_streaming_call(_api_kwargs, on_first_delta=None):
+            if on_first_delta:
+                on_first_delta()
+            agent._fire_stream_delta("Let me check that for you.")
+            agent._streamed_visible_text_had_tool_calls = True
+            return SimpleNamespace(choices=[], model="test/model", usage=None)
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_streaming_api_call", side_effect=_bad_streaming_call),
+            patch("run_agent.jittered_backoff", return_value=0.0),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert "final_response" not in result
+        assert len(deltas) >= 1
+        assert all(delta == "Let me check that for you." for delta in deltas)
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
