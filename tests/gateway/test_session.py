@@ -804,6 +804,101 @@ class TestSessionStoreEntriesAttribute:
         assert not hasattr(store, "_sessions")
 
 
+class TestLoadedSessionKeyMigration:
+    """Legacy loaded session keys should normalize to the current canonical form."""
+
+    def test_migrates_legacy_dm_key_to_chat_specific_key(self, tmp_path):
+        sessions_file = tmp_path / "sessions.json"
+        sessions_file.write_text(json.dumps({
+            "agent:main:telegram:dm": {
+                "session_key": "agent:main:telegram:dm",
+                "session_id": "legacy_sid",
+                "created_at": "2026-03-15T08:44:19.934512",
+                "updated_at": "2026-03-15T10:13:52.397589",
+                "display_name": "LemonSqueeze",
+                "platform": "telegram",
+                "chat_type": "dm",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "8578467390",
+                    "chat_name": "LemonSqueeze",
+                    "chat_type": "dm",
+                    "user_id": "8578467390",
+                    "user_name": "LemonSqueeze",
+                    "thread_id": None,
+                    "chat_topic": None,
+                },
+            },
+        }))
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        store._ensure_loaded()
+
+        assert "agent:main:telegram:dm" not in store._entries
+        assert "agent:main:telegram:dm:8578467390" in store._entries
+        assert store._entries["agent:main:telegram:dm:8578467390"].session_id == "legacy_sid"
+
+        persisted = json.loads(sessions_file.read_text())
+        assert "agent:main:telegram:dm" not in persisted
+        assert "agent:main:telegram:dm:8578467390" in persisted
+
+    def test_drops_stale_legacy_dm_key_when_newer_canonical_key_exists(self, tmp_path):
+        sessions_file = tmp_path / "sessions.json"
+        sessions_file.write_text(json.dumps({
+            "agent:main:telegram:dm": {
+                "session_key": "agent:main:telegram:dm",
+                "session_id": "legacy_sid",
+                "created_at": "2026-03-15T08:44:19.934512",
+                "updated_at": "2026-03-15T10:13:52.397589",
+                "display_name": "Josh Schneider",
+                "platform": "telegram",
+                "chat_type": "dm",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "8578467390",
+                    "chat_name": "Josh Schneider",
+                    "chat_type": "dm",
+                    "user_id": "8578467390",
+                    "user_name": "Josh Schneider",
+                    "thread_id": None,
+                    "chat_topic": None,
+                },
+            },
+            "agent:main:telegram:dm:8578467390": {
+                "session_key": "agent:main:telegram:dm:8578467390",
+                "session_id": "current_sid",
+                "created_at": "2026-04-07T07:33:07.329558",
+                "updated_at": "2026-04-07T08:46:25.094658",
+                "display_name": "LemonSqueeze",
+                "platform": "telegram",
+                "chat_type": "dm",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "8578467390",
+                    "chat_name": "LemonSqueeze",
+                    "chat_type": "dm",
+                    "user_id": "8578467390",
+                    "user_name": "LemonSqueeze",
+                    "thread_id": None,
+                    "chat_topic": None,
+                },
+            },
+        }))
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        store._ensure_loaded()
+
+        assert "agent:main:telegram:dm" not in store._entries
+        assert "agent:main:telegram:dm:8578467390" in store._entries
+        assert store._entries["agent:main:telegram:dm:8578467390"].session_id == "current_sid"
+
+        persisted = json.loads(sessions_file.read_text())
+        assert "agent:main:telegram:dm" not in persisted
+        assert persisted["agent:main:telegram:dm:8578467390"]["session_id"] == "current_sid"
+
+
 class TestHasAnySessions:
     """Tests for has_any_sessions() fix (issue #351)."""
 

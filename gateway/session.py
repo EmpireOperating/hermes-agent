@@ -536,8 +536,44 @@ class SessionStore:
             except Exception as e:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
+        migrated = self._normalize_loaded_session_keys_locked()
         self._loaded = True
-    
+        if migrated:
+            try:
+                self._save()
+            except Exception as e:
+                logger.debug("Failed to persist migrated session keys: %s", e)
+
+    def _normalize_loaded_session_keys_locked(self) -> bool:
+        """Normalize stale loaded session keys to the current canonical form."""
+        migrated = False
+        for key in list(self._entries.keys()):
+            entry = self._entries.get(key)
+            if entry is None or entry.origin is None:
+                continue
+            try:
+                canonical_key = self._generate_session_key(entry.origin)
+            except Exception:
+                continue
+            if not canonical_key or canonical_key == key:
+                continue
+
+            existing = self._entries.get(canonical_key)
+            if existing is None or entry.updated_at > existing.updated_at:
+                entry.session_key = canonical_key
+                self._entries[canonical_key] = entry
+                logger.info("Migrated session key %s -> %s", key, canonical_key)
+            else:
+                logger.info(
+                    "Dropping stale session key %s in favor of canonical %s",
+                    key,
+                    canonical_key,
+                )
+            del self._entries[key]
+            migrated = True
+
+        return migrated
+     
     def _save(self) -> None:
         """Save sessions index to disk (kept for session key -> ID mapping)."""
         import tempfile
