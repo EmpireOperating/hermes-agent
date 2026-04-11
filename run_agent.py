@@ -823,6 +823,10 @@ class AIAgent:
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
+        # Visible text that was already streamed to the user during the current
+        # API attempt. Lets us salvage a response if the provider later returns a
+        # malformed final object after successful text delivery.
+        self._streamed_visible_text_parts: List[str] = []
         # Deferred paragraph break flag — set after tool iterations so a
         # single "\n\n" is prepended to the next real text delta.
         self._stream_needs_break = False
@@ -4593,6 +4597,12 @@ class AIAgent:
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
+    def _reset_streamed_visible_text(self) -> None:
+        self._streamed_visible_text_parts = []
+
+    def _get_streamed_visible_text(self) -> str:
+        return "".join(getattr(self, "_streamed_visible_text_parts", [])).strip()
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
         # If a tool iteration set the break flag, prepend a single paragraph
@@ -4602,6 +4612,8 @@ class AIAgent:
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
+        if isinstance(text, str) and text:
+            self._streamed_visible_text_parts.append(text)
         for cb in (self.stream_delta_callback, self._stream_callback):
             if cb is not None:
                 try:
@@ -7415,6 +7427,7 @@ class AIAgent:
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
+        self._reset_streamed_visible_text()
         self._persist_user_message_idx = None
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
@@ -7931,6 +7944,7 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
+                    self._reset_streamed_visible_text()
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(
                             api_kwargs, on_first_delta=_stop_spinner
@@ -8022,10 +8036,34 @@ class AIAgent:
                             thinking_spinner = None
                         if self.thinking_callback:
                             self.thinking_callback("")
-                        
+
+                        streamed_visible_text = self._get_streamed_visible_text()
+                        if self.api_mode == "chat_completions" and streamed_visible_text:
+                            logger.warning(
+                                "Salvaging malformed chat_completions final response from %d streamed chars.",
+                                len(streamed_visible_text),
+                            )
+                            response = SimpleNamespace(
+                                choices=[
+                                    SimpleNamespace(
+                                        message=SimpleNamespace(
+                                            role="assistant",
+                                            content=streamed_visible_text,
+                                            tool_calls=None,
+                                            reasoning_content=None,
+                                        ),
+                                        finish_reason="stop",
+                                    )
+                                ],
+                                model=getattr(response, "model", None) if response is not None else None,
+                                usage=getattr(response, "usage", None) if response is not None else None,
+                            )
+                            response_invalid = False
+
+                    if response_invalid:
                         # This is often rate limiting or provider returning malformed response
                         retry_count += 1
-                        
+
                         # Eager fallback: empty/malformed responses are a common
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
@@ -8045,18 +8083,18 @@ class AIAgent:
                                 provider_name = response.error.metadata.get('provider_name', 'Unknown')
                         elif response and hasattr(response, 'message') and response.message:
                             error_msg = str(response.message)
-                        
+
                         # Try to get provider from model field (OpenRouter often returns actual model used)
                         if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
                             provider_name = f"model={response.model}"
-                        
+
                         # Check for x-openrouter-provider or similar metadata
                         if provider_name == "Unknown" and response:
                             # Log all response attributes for debugging
                             resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
                             if self.verbose_logging:
                                 logging.debug(f"Response attributes for invalid response: {resp_attrs}")
-                        
+
                         self._vprint(f"{self.log_prefix}⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}", force=True)
                         self._vprint(f"{self.log_prefix}   🏢 Provider: {provider_name}", force=True)
                         cleaned_provider_error = self._clean_error_message(error_msg)
