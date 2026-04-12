@@ -291,19 +291,16 @@ class TestMatrixSendVoiceMSC3245:
     @patch("mimetypes.guess_type", return_value=("audio/ogg", None))
     async def test_send_voice_includes_msc3245_field(self, _mock_guess):
         """send_voice should include org.matrix.msc3245.voice in message content."""
-        # Create a temp audio file
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
             f.write(b"fake audio data")
             temp_path = f.name
 
         try:
-            # Capture the message content sent via send_message_event
             sent_content = None
 
             async def mock_send_message_event(room_id, event_type, content):
                 nonlocal sent_content
                 sent_content = content
-                # send_message_event returns an EventID string
                 return "$sent_event"
 
             self.adapter._client.send_message_event = mock_send_message_event
@@ -323,6 +320,5 @@ class TestMatrixSendVoiceMSC3245:
             assert isinstance(self.upload_call["data"], bytes)
             assert self.upload_call["mime_type"] == "audio/ogg"
             assert self.upload_call["filename"].endswith(".ogg")
-
         finally:
             os.unlink(temp_path)
