@@ -256,6 +256,23 @@ class SessionDB:
                 self._conn.close()
                 self._conn = None
 
+    def _ensure_table_columns(self, cursor, table_name: str, required_columns: List[tuple[str, str]]):
+        """Ensure the given SQLite table has every required column.
+
+        This is a schema-repair guard for partial/broken historical migrations.
+        We inspect the live table shape instead of trusting schema_version alone.
+        """
+        existing = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        }
+        for name, column_type in required_columns:
+            if name in existing:
+                continue
+            safe_name = name.replace('"', '""')
+            cursor.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {column_type}')
+            existing.add(name)
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, run migrations."""
         cursor = self._conn.cursor()
@@ -271,17 +288,11 @@ class SessionDB:
             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
             if current_version < 2:
                 # v2: add finish_reason column to messages
-                try:
-                    cursor.execute("ALTER TABLE messages ADD COLUMN finish_reason TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                self._ensure_table_columns(cursor, "messages", [("finish_reason", "TEXT")])
                 cursor.execute("UPDATE schema_version SET version = 2")
             if current_version < 3:
                 # v3: add title column to sessions
-                try:
-                    cursor.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                self._ensure_table_columns(cursor, "sessions", [("title", "TEXT")])
                 cursor.execute("UPDATE schema_version SET version = 3")
             if current_version < 4:
                 # v4: add unique index on title (NULLs allowed, only non-NULL must be unique)
@@ -294,28 +305,23 @@ class SessionDB:
                     pass  # Index already exists
                 cursor.execute("UPDATE schema_version SET version = 4")
             if current_version < 5:
-                new_columns = [
-                    ("cache_read_tokens", "INTEGER DEFAULT 0"),
-                    ("cache_write_tokens", "INTEGER DEFAULT 0"),
-                    ("reasoning_tokens", "INTEGER DEFAULT 0"),
-                    ("billing_provider", "TEXT"),
-                    ("billing_base_url", "TEXT"),
-                    ("billing_mode", "TEXT"),
-                    ("estimated_cost_usd", "REAL"),
-                    ("actual_cost_usd", "REAL"),
-                    ("cost_status", "TEXT"),
-                    ("cost_source", "TEXT"),
-                    ("pricing_version", "TEXT"),
-                ]
-                for name, column_type in new_columns:
-                    try:
-                        # name and column_type come from the hardcoded tuple above,
-                        # not user input. Double-quote identifier escaping is applied
-                        # as defense-in-depth; SQLite DDL cannot be parameterized.
-                        safe_name = name.replace('"', '""')
-                        cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
-                    except sqlite3.OperationalError:
-                        pass
+                self._ensure_table_columns(
+                    cursor,
+                    "sessions",
+                    [
+                        ("cache_read_tokens", "INTEGER DEFAULT 0"),
+                        ("cache_write_tokens", "INTEGER DEFAULT 0"),
+                        ("reasoning_tokens", "INTEGER DEFAULT 0"),
+                        ("billing_provider", "TEXT"),
+                        ("billing_base_url", "TEXT"),
+                        ("billing_mode", "TEXT"),
+                        ("estimated_cost_usd", "REAL"),
+                        ("actual_cost_usd", "REAL"),
+                        ("cost_status", "TEXT"),
+                        ("cost_source", "TEXT"),
+                        ("pricing_version", "TEXT"),
+                    ],
+                )
                 cursor.execute("UPDATE schema_version SET version = 5")
             if current_version < 6:
                 # v6: add reasoning columns to messages table — preserves assistant
@@ -323,18 +329,15 @@ class SessionDB:
                 # session turns.  Without these, reasoning chains are lost on
                 # session reload, breaking multi-turn reasoning continuity for
                 # providers that replay reasoning (OpenRouter, OpenAI, Nous).
-                for col_name, col_type in [
-                    ("reasoning", "TEXT"),
-                    ("reasoning_details", "TEXT"),
-                    ("codex_reasoning_items", "TEXT"),
-                ]:
-                    try:
-                        safe = col_name.replace('"', '""')
-                        cursor.execute(
-                            f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
-                        )
-                    except sqlite3.OperationalError:
-                        pass  # Column already exists
+                self._ensure_table_columns(
+                    cursor,
+                    "messages",
+                    [
+                        ("reasoning", "TEXT"),
+                        ("reasoning_details", "TEXT"),
+                        ("codex_reasoning_items", "TEXT"),
+                    ],
+                )
                 cursor.execute("UPDATE schema_version SET version = 6")
             if current_version < 7:
                 # v7: preserve provider-native reasoning_content separately from
@@ -356,6 +359,36 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 8")
+
+        # Repair any partial historical migration regardless of recorded version.
+        self._ensure_table_columns(
+            cursor,
+            "sessions",
+            [
+                ("title", "TEXT"),
+                ("cache_read_tokens", "INTEGER DEFAULT 0"),
+                ("cache_write_tokens", "INTEGER DEFAULT 0"),
+                ("reasoning_tokens", "INTEGER DEFAULT 0"),
+                ("billing_provider", "TEXT"),
+                ("billing_base_url", "TEXT"),
+                ("billing_mode", "TEXT"),
+                ("estimated_cost_usd", "REAL"),
+                ("actual_cost_usd", "REAL"),
+                ("cost_status", "TEXT"),
+                ("cost_source", "TEXT"),
+                ("pricing_version", "TEXT"),
+            ],
+        )
+        self._ensure_table_columns(
+            cursor,
+            "messages",
+            [
+                ("finish_reason", "TEXT"),
+                ("reasoning", "TEXT"),
+                ("reasoning_details", "TEXT"),
+                ("codex_reasoning_items", "TEXT"),
+            ],
+        )
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
