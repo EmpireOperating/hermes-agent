@@ -329,7 +329,15 @@ def session_search(
     The current session is excluded from results since the agent already has that context.
     """
     if db is None:
-        return tool_error("Session database not available.", success=False)
+        # Defensive fallback: some runtimes may fail to inject session_db even
+        # when the default Hermes state DB is available.
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+        except Exception as e:
+            logging.warning("Session search DB unavailable: %s", e)
+            return tool_error("Session database not available.", success=False)
 
     # Defensive: models (especially open-source) may send non-int limit values
     # (None when JSON null, string "int", or even a type object).  Coerce to a

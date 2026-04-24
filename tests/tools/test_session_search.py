@@ -1,8 +1,12 @@
 """Tests for tools/session_search_tool.py — helper functions and search dispatcher."""
 
 import asyncio
+import builtins
 import json
+import sys
 import time
+from types import SimpleNamespace
+
 import pytest
 
 from tools.session_search_tool import (
@@ -245,9 +249,34 @@ class TestSessionSearchConcurrency:
 # =========================================================================
 
 class TestSessionSearch:
-    def test_no_db_returns_error(self):
+    def test_no_db_falls_back_to_default_sessiondb(self, monkeypatch):
         from tools.session_search_tool import session_search
-        result = json.loads(session_search(query="test"))
+
+        class FakeSessionDB:
+            def list_sessions_rich(self, limit, exclude_sources):
+                return []
+
+        fake_module = SimpleNamespace(SessionDB=FakeSessionDB)
+        monkeypatch.setitem(sys.modules, "hermes_state", fake_module)
+        result = json.loads(session_search(query="", db=None))
+
+        assert result["success"] is True
+        assert result["mode"] == "recent"
+        assert result["count"] == 0
+
+    def test_no_db_returns_error_when_default_sessiondb_unavailable(self, monkeypatch):
+        from tools.session_search_tool import session_search
+
+        real_import = builtins.__import__
+
+        def _raising_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "hermes_state":
+                raise ImportError("boom")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr("builtins.__import__", _raising_import)
+        result = json.loads(session_search(query="test", db=None))
+
         assert result["success"] is False
         assert "not available" in result["error"].lower()
 
