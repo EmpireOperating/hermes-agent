@@ -79,6 +79,25 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_orchestration_settings_configure_completion_supervisor(
+    client, monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "orca"
+    )
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration",
+        json={"supervisor_profile": "orca"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["supervisor_profile"] == "orca"
+    persisted = client.get("/api/plugins/kanban/orchestration")
+    assert persisted.status_code == 200
+    assert persisted.json()["supervisor_profile"] == "orca"
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

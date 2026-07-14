@@ -279,6 +279,24 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                # Supervisor failures are internal review
+                                # retries, not mission outcomes. The payload
+                                # is stamped at emission time, making this
+                                # race-safe if signoff lands before this poll.
+                                # Claim and advance past them silently; only a
+                                # signed completion or explicit block reaches
+                                # the subscribed user/session.
+                                events = [
+                                    event for event in events
+                                    if not (
+                                        event.kind in {
+                                            "gave_up", "crashed", "timed_out",
+                                        }
+                                        and (event.payload or {}).get(
+                                            "supervisor_retry"
+                                        )
+                                    )
+                                ]
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -365,6 +383,17 @@ class GatewayKanbanWatchersMixin:
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
                             )
+                            signoff = (
+                                ev.payload.get("supervisor_signoff")
+                                if ev.payload else None
+                            )
+                            if signoff:
+                                label = (
+                                    "Orca-signoff"
+                                    if str(signoff).casefold() == "orca"
+                                    else f"{signoff}-signoff"
+                                )
+                                msg = f"✅ {label}\n{msg}"
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):

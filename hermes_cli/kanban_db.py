@@ -123,6 +123,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+SUPERVISOR_SIGNOFF_STEP = "supervisor_signoff"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -2900,6 +2901,16 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["child_id"] for r in rows]
 
 
+def is_terminal_deliverable(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether completing ``task_id`` exits its dependency graph.
+
+    Parent→child links encode the next internal Kanban stage. A task with a
+    child therefore still has board-local work to release and completes
+    normally; only a sink node needs the optional supervisor signoff gate.
+    """
+    return not child_ids(conn, task_id)
+
+
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
@@ -3975,6 +3986,95 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def submit_task_for_supervisor_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    supervisor_profile: str,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Close a worker run and route its deliverable to supervisor review.
+
+    This is deliberately not a completion: dependents remain gated, notifier
+    subscribers see no final mission signal, and the workspace stays intact for
+    the supervisor. The closed worker run carries the full structured handoff;
+    :func:`build_worker_context` surfaces it to the supervisor on the next run.
+    """
+    supervisor_profile = _canonical_assignee(supervisor_profile)
+    if not supervisor_profile:
+        raise ValueError("supervisor_profile is required")
+    assert supervisor_profile is not None
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["current_step_key"] == SUPERVISOR_SIGNOFF_STEP:
+            return False
+        worker_profile = row["assignee"]
+        params: list[Any] = [supervisor_profile, SUPERVISOR_SIGNOFF_STEP, task_id]
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'review', assignee = ?, current_step_key = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0
+             WHERE id = ? AND status = 'running'
+            """ + run_guard,
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            return False
+        review_metadata = dict(metadata or {})
+        review_metadata.update(
+            {
+                "submitted_by": worker_profile,
+                "supervisor_profile": supervisor_profile,
+                "review_step": SUPERVISOR_SIGNOFF_STEP,
+            }
+        )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="submitted_for_review",
+            status="review",
+            summary=summary if summary is not None else result,
+            metadata=review_metadata,
+        )
+        ev_summary = (summary if summary is not None else result) or ""
+        ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        _append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {
+                "worker_profile": worker_profile,
+                "supervisor_profile": supervisor_profile,
+                "summary": ev_summary or None,
+                "requested_at": now,
+            },
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_review_requested",
+        task_id,
+        board=get_current_board(),
+        assignee=supervisor_profile,
+        run_id=run_id,
+        summary=(summary if summary is not None else result),
+    )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3984,6 +4084,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    signoff_profile: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4107,6 +4208,10 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if signoff_profile:
+            completed_payload["supervisor_signoff"] = _canonical_assignee(
+                signoff_profile
+            )
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6105,7 +6210,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_step_key, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -6169,6 +6274,8 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                if row["current_step_key"] == SUPERVISOR_SIGNOFF_STEP:
+                    payload["supervisor_retry"] = True
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -6382,7 +6489,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_step_key "
+            "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -6454,6 +6562,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+
+            if row["current_step_key"] == SUPERVISOR_SIGNOFF_STEP:
+                event_payload["supervisor_retry"] = True
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6590,13 +6701,14 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_step_key "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
+        supervisor_retry = row["current_step_key"] == SUPERVISOR_SIGNOFF_STEP
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -6610,7 +6722,7 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if failures >= effective_limit:
+        if failures >= effective_limit and not supervisor_retry:
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -6685,10 +6797,11 @@ def _record_task_failure(
                     error=error[:500],
                     metadata={"failures": failures},
                 )
+                event_payload = {"error": error[:500], "failures": failures}
+                if supervisor_retry:
+                    event_payload["supervisor_retry"] = True
                 _append_event(
-                    conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
-                    run_id=run_id,
+                    conn, task_id, outcome, event_payload, run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
@@ -7315,10 +7428,9 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # Review tasks are worker deliverables awaiting the configured supervisor.
+    # Their worker context carries the outcome protocol; no optional skill is
+    # required, which keeps this path reliable even on minimal profiles.
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
@@ -7366,12 +7478,6 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -7960,6 +8066,30 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    if task.current_step_key == SUPERVISOR_SIGNOFF_STEP:
+        lines.append("## Supervisor signoff protocol")
+        lines.append(
+            "You are the configured supervisor reviewing a worker deliverable; "
+            "the worker's raw handoff below is not a final user-facing result."
+        )
+        lines.append(
+            "- Approve only after independently checking the acceptance criteria "
+            "and evidence, then call `kanban_complete`; the system will stamp the "
+            "final completion with your supervisor signoff."
+        )
+        lines.append(
+            "- Reject or request QA by creating the required follow-up/QA cards, "
+            "linking each as a parent of this task with `kanban_link`, then call "
+            "`kanban_block(kind=\"dependency\")`. Parent gating will return this "
+            "review to you after those cards finish."
+        )
+        lines.append(
+            "- If and only if a human decision or operation is genuinely required, "
+            "leave precise context with `kanban_comment` and call `kanban_block` "
+            "with kind `needs_input` or `capability`."
+        )
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

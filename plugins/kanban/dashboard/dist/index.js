@@ -1680,7 +1680,7 @@
           className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
         }, msg.text) : null,
 
-        settings ? h("div", { className: "grid gap-3 sm:grid-cols-3" },
+        settings ? h("div", { className: "grid gap-3 sm:grid-cols-4" },
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },
               "Orchestrator profile"),
@@ -1714,6 +1714,23 @@
             ),
             h("div", { className: "text-[10px] text-muted-foreground" },
               "Resolved: " + (settings.resolved_default_assignee || "default")),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs text-muted-foreground" },
+              "Completion supervisor"),
+            h(Select, Object.assign({
+              value: settings.supervisor_profile || "",
+              className: "h-8",
+            }, selectChangeHandler(function (v) {
+              saveSettings({ supervisor_profile: v });
+            })),
+              h(SelectOption, { value: "" }, "(disabled)"),
+              profileOptions,
+            ),
+            h("div", { className: "text-[10px] text-muted-foreground" },
+              settings.supervisor_profile
+                ? "Worker handoffs wait for this profile's signoff."
+                : "Workers complete tasks directly."),
           ),
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },

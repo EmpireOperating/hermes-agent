@@ -180,6 +180,9 @@ def _connect(board: Optional[str] = None):
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_SUPERVISOR_GOAL_MODE_BLOCK_ALLOWED_KINDS = (
+    _GOAL_MODE_BLOCK_ALLOWED_KINDS | {"capability"}
+)
 
 
 def _goal_judge_available() -> bool:
@@ -299,6 +302,29 @@ def _normalize_profile(value: Any) -> Optional[str]:
     if not text or text.lower() in {"none", "-", "null"}:
         return None
     return text
+
+
+def _canonical_profile(value: Any) -> str:
+    """Return a profile id in the same canonical form used by Kanban rows."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    from hermes_cli.profiles import normalize_profile_name
+
+    return normalize_profile_name(text)
+
+
+def _supervisor_identity_error(task_id: str, expected_profile: Any) -> Optional[str]:
+    """Authenticate the process identity before a supervisor-only mutation."""
+    expected = _canonical_profile(expected_profile)
+    active = _canonical_profile(os.environ.get("HERMES_PROFILE"))
+    if expected and active == expected:
+        return None
+    return tool_error(
+        f"supervisor action for {task_id} requires active "
+        f"HERMES_PROFILE={expected!r}; got {active or '<unset>'!r}. "
+        f"No supervisor transition was emitted."
+    )
 
 
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
@@ -592,12 +618,40 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+
+            # Authenticate supervisor-only completion before invoking the goal
+            # judge or making any state change. Profile ids are canonicalized
+            # exactly like task assignees (dashboard labels may be title-cased).
+            kanban_cfg = load_config().get("kanban", {})
+            supervisor_profile = _canonical_profile(
+                (kanban_cfg or {}).get("supervisor_profile")
+            )
+            is_supervisor_review = bool(
+                task and task.current_step_key == kb.SUPERVISOR_SIGNOFF_STEP
+            )
+            is_terminal_deliverable = bool(
+                task and kb.is_terminal_deliverable(conn, tid)
+            )
+            is_direct_supervisor_signoff = bool(
+                task
+                and supervisor_profile
+                and is_terminal_deliverable
+                and task.assignee == supervisor_profile
+            )
+            if is_supervisor_review or is_direct_supervisor_signoff:
+                identity_err = _supervisor_identity_error(
+                    tid,
+                    task.assignee if task else supervisor_profile,
+                )
+                if identity_err:
+                    return identity_err
+
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
-            task = kb.get_task(conn, tid)
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -623,12 +677,96 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
+            # Optional two-stage completion gate. A normal worker submits its
+            # structured handoff into Review; a task already stamped with the
+            # supervisor step is the supervisor's own run and may complete.
+            if (
+                task
+                and supervisor_profile
+                and os.environ.get("HERMES_KANBAN_TASK") == tid
+                and is_terminal_deliverable
+                and task.assignee != supervisor_profile
+                and not is_supervisor_review
+            ):
+                try:
+                    from hermes_cli.profiles import profile_exists
+
+                    supervisor_exists = profile_exists(supervisor_profile)
+                except Exception:
+                    supervisor_exists = False
+                if not supervisor_exists:
+                    return tool_error(
+                        f"kanban.supervisor_profile={supervisor_profile!r} does "
+                        f"not resolve to an installed Hermes profile. The worker "
+                        f"handoff remains in-flight; fix the profile/config and "
+                        f"retry kanban_complete."
+                    )
+                if created_cards:
+                    verified, phantom = kb._verify_created_cards(conn, tid, created_cards)
+                    if phantom:
+                        return tool_error(
+                            f"kanban_complete blocked: the following created_cards "
+                            f"do not exist or were not created by this worker: "
+                            f"{', '.join(phantom)}. Your task is still in-flight "
+                            f"(no state change)."
+                        )
+                    metadata = dict(metadata or {})
+                    metadata["verified_created_cards"] = verified
+                ok = kb.submit_task_for_supervisor_review(
+                    conn,
+                    tid,
+                    supervisor_profile=supervisor_profile,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if not ok:
+                    return tool_error(
+                        f"could not submit {tid} for supervisor review "
+                        f"(unknown id, stale run, or invalid state)"
+                    )
+                run = kb.latest_run(conn, tid)
+                return _ok(
+                    task_id=tid,
+                    run_id=run.id if run else None,
+                    status="review",
+                    supervisor_profile=supervisor_profile,
+                )
+
+            has_supervisor_signoff = (
+                is_supervisor_review or is_direct_supervisor_signoff
+            )
+            if has_supervisor_signoff:
+                metadata = dict(metadata or {})
+                # Preserve worker-produced deliverables through signoff even
+                # when the supervisor only supplies review evidence. The raw
+                # handoff was intentionally not notified, so dropping these
+                # paths here would make approved artifacts disappear.
+                submissions = kb.list_runs(
+                    conn,
+                    tid,
+                    include_active=False,
+                    state_type="outcome",
+                    state_name="submitted_for_review",
+                )
+                if submissions and "artifacts" not in metadata:
+                    submitted_artifacts = (submissions[-1].metadata or {}).get(
+                        "artifacts"
+                    )
+                    if submitted_artifacts:
+                        metadata["artifacts"] = submitted_artifacts
+                metadata["supervisor_signoff"] = task.assignee
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    signoff_profile=(
+                        task.assignee if has_supervisor_signoff else None
+                    ),
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -655,7 +793,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status="done",
+                supervisor_signoff=(
+                    task.assignee if has_supervisor_signoff else None
+                ),
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -699,15 +844,23 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        if task and task.current_step_key == kb.SUPERVISOR_SIGNOFF_STEP:
+            identity_err = _supervisor_identity_error(tid, task.assignee)
+            if identity_err:
+                conn.close()
+                return identity_err
+        allowed_goal_block_kinds = _GOAL_MODE_BLOCK_ALLOWED_KINDS
+        if task and task.current_step_key == kb.SUPERVISOR_SIGNOFF_STEP:
+            allowed_goal_block_kinds = _SUPERVISOR_GOAL_MODE_BLOCK_ALLOWED_KINDS
         if (
             task
             and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            and kind not in allowed_goal_block_kinds
         ):
             conn.close()
             return tool_error(
                 f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                f"{sorted(allowed_goal_block_kinds)} (got {kind!r}). "
                 f"If the task is actually finished or cannot proceed for "
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
@@ -1211,7 +1364,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. When "
+        "``kanban.supervisor_profile`` is configured, a terminal worker's "
+        "first completion submits this handoff for supervisor review; only "
+        "the supervisor's approval emits the final done notification."
     ),
     "parameters": {
         "type": "object",

@@ -105,6 +105,83 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
     assert adapter2.sent == []
 
 
+def test_kanban_notifier_marks_orca_supervisor_signoff(tmp_path, monkeypatch):
+    db_path = tmp_path / "orca-signoff.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="supervised mission", assignee="orca")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1"
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="reviewed and approved",
+            signoff_profile="orca",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith("✅ Orca-signoff\n")
+    assert "reviewed and approved" in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_suppresses_supervisor_retry_failures(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "supervisor-retries.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="supervised mission", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.submit_task_for_supervisor_review(
+            conn,
+            tid,
+            supervisor_profile="orca",
+            summary="worker handoff",
+            expected_run_id=claimed.current_run_id,
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1"
+        )
+        for kind in ("crashed", "timed_out", "gave_up"):
+            kb._append_event(
+                conn, tid, kind, {"supervisor_retry": True, "error": "retry"}
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+    assert _unseen_terminal_events(tid) == []
+
+    # A precise supervisor-authored human block is still user-facing.
+    conn = kb.connect()
+    try:
+        kb._append_event(
+            conn,
+            tid,
+            "blocked",
+            {"reason": "physical device access is required"},
+        )
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert "physical device access is required" in adapter.sent[0]["text"]
+
+
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
     db_path = tmp_path / "adapter-disconnect.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

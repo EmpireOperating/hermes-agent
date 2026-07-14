@@ -2252,12 +2252,13 @@ def decompose_task_endpoint(
 
 # ---------------------------------------------------------------------------
 # Orchestration settings (kanban.orchestrator_profile / default_assignee /
-# auto_decompose) — surfaced to the dashboard's settings panel
+# supervisor_profile / auto_decompose) — surfaced to the dashboard settings
 # ---------------------------------------------------------------------------
 
 class OrchestrationSettingsBody(BaseModel):
     orchestrator_profile: Optional[str] = None
     default_assignee: Optional[str] = None
+    supervisor_profile: Optional[str] = None
     auto_decompose: Optional[bool] = None
     auto_promote_children: Optional[bool] = None
 
@@ -2274,6 +2275,7 @@ def get_orchestration_settings():
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
+    explicit_supervisor = (kanban_cfg.get("supervisor_profile") or "").strip()
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
@@ -2297,6 +2299,7 @@ def get_orchestration_settings():
     return {
         "orchestrator_profile": explicit_orch,
         "default_assignee": explicit_default,
+        "supervisor_profile": explicit_supervisor,
         "auto_decompose": auto_decompose,
         "auto_promote_children": auto_promote_children,
         "resolved_orchestrator_profile": resolved_orch,
@@ -2310,9 +2313,9 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     """Update the kanban orchestration knobs in ~/.hermes/config.yaml.
 
     Each field is optional — only fields explicitly passed are
-    written. ``orchestrator_profile`` / ``default_assignee`` accept
-    empty strings to clear the override and fall back to the default
-    profile.
+    written. Profile fields accept empty strings; orchestration owners then
+    fall back to the default profile, while an empty completion supervisor
+    disables the signoff gate.
     """
     try:
         from hermes_cli.config import load_config, save_config
@@ -2360,6 +2363,21 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
             except Exception:
                 pass
         kanban_section["default_assignee"] = name
+
+    if payload.supervisor_profile is not None:
+        name = (payload.supervisor_profile or "").strip()
+        if name and profiles_mod is not None:
+            try:
+                if not profiles_mod.profile_exists(name):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"profile '{name}' does not exist",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        kanban_section["supervisor_profile"] = name
 
     if payload.auto_decompose is not None:
         kanban_section["auto_decompose"] = bool(payload.auto_decompose)
