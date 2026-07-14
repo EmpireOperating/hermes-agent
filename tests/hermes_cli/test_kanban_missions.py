@@ -183,6 +183,24 @@ def test_two_repos_and_sessions_stay_strictly_scoped(mission_env, monkeypatch):
         assert "ambient-session-must-not-leak" not in str(mission_b)
         assert mission_a["project_id"] != mission_b["project_id"]
 
+        # Control-room summaries stay explicitly scoped under concurrent
+        # missions; neither ambient cwd nor the other source session leaks in.
+        listed_a = missions.list_missions(
+            conn,
+            project_id=mission_a["project_id"],
+            source_session_id="source-a",
+        )
+        listed_b = missions.list_missions(
+            conn,
+            project_id=mission_b["project_id"],
+            source_session_id="source-b",
+        )
+        assert [item["id"] for item in listed_a] == [mission_a["id"]]
+        assert [item["id"] for item in listed_b] == [mission_b["id"]]
+        assert listed_a[0]["repo_root"] == str(repo_a.resolve())
+        assert listed_b[0]["repo_root"] == str(repo_b.resolve())
+        assert "runs" not in listed_a[0]
+
         root_a = kb.get_task(conn, mission_a["root_task_id"])
         assert root_a is not None
         assert root_a.project_id == mission_a["project_id"]

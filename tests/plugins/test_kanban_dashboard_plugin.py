@@ -137,6 +137,23 @@ def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_pat
     mission = created.json()["mission"]
     assert created.json()["duplicate"] is False
 
+    eligible_projects = client.get("/api/plugins/kanban/mission-projects")
+    assert eligible_projects.status_code == 200
+    assert [item["id"] for item in eligible_projects.json()["projects"]] == [project_id]
+
+    listed = client.get(
+        "/api/plugins/kanban/missions",
+        params={"project_id": project_id, "source_session_id": "session-1"},
+    )
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["missions"]] == [mission["id"]]
+    assert listed.json()["missions"][0]["task_counts"] == {
+        "total": 1, "blocked": 0, "done": 0,
+    }
+    # Mission summaries intentionally exclude noisy internal attempts/events.
+    assert "runs" not in listed.text
+    assert "events" not in listed.text
+
     duplicate = client.post("/api/plugins/kanban/missions", json=payload)
     assert duplicate.status_code == 200
     assert duplicate.json()["duplicate"] is True
@@ -172,6 +189,10 @@ def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_pat
         },
     )
     assert steered.status_code == 200
+    steered_status = client.get(f"/api/plugins/kanban/missions/{mission['id']}").json()
+    assert steered_status["steering"][0]["instruction"] == (
+        "preserve the declared acceptance criteria"
+    )
 
     child_response = client.post(
         f"/api/plugins/kanban/missions/{mission['id']}/children",
@@ -198,6 +219,11 @@ def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_pat
     )
     assert blocker.status_code == 200, blocker.text
     assert blocker.json()["projected"] is True
+    duplicate_blocker = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/blockers",
+        json={"task_id": allocation["task_id"]},
+    )
+    assert duplicate_blocker.json()["projected"] is False
 
     child_worktree = Path(allocation["workspace_path"])
     (child_worktree / "mission.txt").write_text("done\n", encoding="utf-8")
@@ -255,6 +281,45 @@ def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_pat
     )
     assert completion.status_code == 200, completion.text
     assert completion.json()["completed"] is True
+    duplicate_completion = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/completion",
+        json={
+            "signer_profile": "orca",
+            "summary": "must not duplicate",
+            "evidence": {"tests": ["focused: pass"]},
+        },
+    )
+    assert duplicate_completion.json()["completed"] is False
+    final_status = client.get(f"/api/plugins/kanban/missions/{mission['id']}").json()
+    assert final_status["completion"]["summary"] == "acceptance criteria passed"
+
+
+def test_dashboard_mission_control_uses_scoped_idempotent_seams():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+
+    assert "function MissionControlPanel(props)" in bundle
+    assert "window.__HERMES_MISSION_SOURCE__" in bundle
+    assert "no ambient fallback is used" in bundle
+    assert 'query.set("source_session_id", source.session_id)' in bundle
+    assert "Injected source-chat provenance is immutable" in bundle
+    assert "submitRef.current" in bundle
+    assert "statusRequestRef.current" in bundle
+    assert "newMissionSubmissionKey()" in bundle
+    assert "repo_root: project.primary_path" in bundle
+    assert "source_session_id: mission.source.session_id" in bundle
+    assert "Never carry a selected" in bundle
+    assert 'setMissions([]); setSelectedId(""); setStatus(null); setSteerTask("")' in bundle
+    assert 'setFinalSummary(""); setFinalEvidence("{}")' in bundle
+    assert "Project blocker once" in bundle
+    assert 'signer_profile: "orca"' in bundle
+    assert "no duplicate notification was sent" in bundle
+    assert "no duplicate outcome was sent" in bundle
+    # The control-room list consumes mission summaries, not task run/retry rows.
+    assert "`${API}/missions`" in bundle
+    assert "task_runs" not in bundle
 
 
 def test_orchestration_settings_configure_completion_supervisor(

@@ -261,6 +261,288 @@
     };
   }
 
+  function missionLines(value) {
+    return String(value || "").split("\n").map(function (line) { return line.trim(); }).filter(Boolean);
+  }
+
+  function newMissionSubmissionKey() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return `control-room:${window.crypto.randomUUID()}`;
+    }
+    return `control-room:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  }
+
+  function explicitMissionSource() {
+    // A source chat launcher may provide this exact context. Never infer it
+    // from ambient cwd, a globally active session, or recall from another chat.
+    const injected = window.__HERMES_MISSION_SOURCE__ || {};
+    const query = new URLSearchParams(window.location.search || "");
+    return {
+      platform: String(injected.platform || query.get("source_platform") || ""),
+      chat_id: String(injected.chat_id || query.get("source_chat_id") || ""),
+      thread_id: String(injected.thread_id || query.get("source_thread_id") || ""),
+      session_id: String(injected.session_id || query.get("source_session_id") || ""),
+      provenance: (injected.provenance && typeof injected.provenance === "object") ? injected.provenance : {},
+    };
+  }
+
+  function MissionField(props) {
+    return h("label", { className: cn("hermes-mission-field", props.wide && "hermes-mission-field--wide") },
+      h("span", null, props.label), props.children,
+      props.hint ? h("small", null, props.hint) : null);
+  }
+
+  function MissionControlPanel(props) {
+    const source = useMemo(explicitMissionSource, []);
+    const sourceLocked = !!(source.platform && source.chat_id && source.session_id);
+    const [expanded, setExpanded] = useState(false);
+    const [dispatchOpen, setDispatchOpen] = useState(false);
+    const [projects, setProjects] = useState([]);
+    const [missions, setMissions] = useState([]);
+    const [selectedId, setSelectedId] = useState("");
+    const [status, setStatus] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [notice, setNotice] = useState("");
+    const [steerTask, setSteerTask] = useState("");
+    const [steerText, setSteerText] = useState("");
+    const [finalSummary, setFinalSummary] = useState("");
+    const [finalEvidence, setFinalEvidence] = useState("{}");
+    const submitRef = useRef(false);
+    const statusRequestRef = useRef(0);
+    const [draft, setDraft] = useState(function () { return {
+      idempotency_key: newMissionSubmissionKey(),
+      source_platform: source.platform, source_chat_id: source.chat_id,
+      source_thread_id: source.thread_id, source_session_id: source.session_id,
+      project_id: "", objective: "", acceptance_criteria: "", constraints: "",
+      non_goals: "", base_commit: "", source_branch: "",
+    }; });
+
+    function draftField(name, value) {
+      setDraft(function (current) { return Object.assign({}, current, { [name]: value }); });
+    }
+    const loadMissions = useCallback(function () {
+      const query = new URLSearchParams();
+      // A source-chat launch sees only that chat session's receipts. A plain
+      // control-room launch intentionally sees the whole selected board.
+      if (source.session_id) query.set("source_session_id", source.session_id);
+      const path = query.toString() ? `${API}/missions?${query}` : `${API}/missions`;
+      return SDK.fetchJSON(withBoard(path, props.board))
+        .then(function (data) { setMissions((data && data.missions) || []); })
+        .catch(function (e) { setNotice(parseApiErrorMessage(e)); });
+    }, [props.board, source.session_id]);
+    const loadStatus = useCallback(function (id) {
+      if (!id) return Promise.resolve();
+      const requestId = ++statusRequestRef.current;
+      return SDK.fetchJSON(withBoard(`${API}/missions/${encodeURIComponent(id)}`, props.board))
+        .then(function (data) {
+          // Ignore a slower response for a mission the operator has already
+          // switched away from; evidence and steering must never cross cards.
+          if (requestId !== statusRequestRef.current) return;
+          setStatus(data);
+          const tasks = data.tasks || [];
+          setSteerTask(function (current) {
+            return tasks.some(function (task) { return task.task_id === current; })
+              ? current : (tasks.length ? tasks[0].task_id : "");
+          });
+        }).catch(function (e) { setNotice(parseApiErrorMessage(e)); });
+    }, [props.board]);
+
+    useEffect(function () {
+      if (!expanded) return undefined;
+      SDK.fetchJSON(`${API}/mission-projects`)
+        .then(function (data) { setProjects((data && data.projects) || []); })
+        .catch(function (e) { setNotice(parseApiErrorMessage(e)); });
+      loadMissions();
+      return undefined;
+    }, [expanded, loadMissions]);
+    useEffect(function () {
+      // Mission ids and receipts are board-local. Never carry a selected
+      // mission across a board/project switch.
+      statusRequestRef.current += 1;
+      setMissions([]); setSelectedId(""); setStatus(null); setSteerTask("");
+      setFinalSummary(""); setFinalEvidence("{}");
+    }, [props.board]);
+    useEffect(function () {
+      if (!expanded || !selectedId) return undefined;
+      loadStatus(selectedId);
+      const timer = setInterval(function () { loadStatus(selectedId); }, 5000);
+      return function () { clearInterval(timer); };
+    }, [expanded, selectedId, loadStatus]);
+
+    const project = projects.find(function (item) { return item.id === draft.project_id; }) || null;
+    function postMission(path, body, success) {
+      setBusy(true); setNotice("");
+      return SDK.fetchJSON(withBoard(`${API}${path}`, props.board), {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      }).then(success).catch(function (e) { setNotice(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    }
+    function dispatchMission(event) {
+      event.preventDefault();
+      if (submitRef.current) return;
+      const acceptance = missionLines(draft.acceptance_criteria);
+      if (!project || !project.primary_path || !draft.objective.trim() || !acceptance.length) {
+        setNotice("Select a project with a primary repo, then add an objective and acceptance criteria."); return;
+      }
+      if (!draft.source_platform.trim() || !draft.source_chat_id.trim() || !draft.source_session_id.trim()) {
+        setNotice("Explicit source platform, chat, and session are required; no ambient fallback is used."); return;
+      }
+      if (sourceLocked && (draft.source_platform.trim() !== source.platform ||
+          draft.source_chat_id.trim() !== source.chat_id ||
+          draft.source_thread_id.trim() !== source.thread_id ||
+          draft.source_session_id.trim() !== source.session_id)) {
+        setNotice("Injected source-chat provenance is immutable for this dispatch."); return;
+      }
+      if (!draft.base_commit.trim() || !draft.source_branch.trim()) {
+        setNotice("Base commit and source branch are required."); return;
+      }
+      submitRef.current = true;
+      const payload = {
+        idempotency_key: draft.idempotency_key,
+        source_platform: draft.source_platform.trim(), source_chat_id: draft.source_chat_id.trim(),
+        source_thread_id: draft.source_thread_id.trim(), source_session_id: draft.source_session_id.trim(),
+        project_id: draft.project_id, objective: draft.objective.trim(), acceptance_criteria: acceptance,
+        constraints: missionLines(draft.constraints), non_goals: missionLines(draft.non_goals),
+        current_chat_provenance: Object.assign({}, source.provenance, {
+          launch_surface: "kanban-control-room", session_id: draft.source_session_id.trim(),
+        }),
+        repo_root: project.primary_path, base_commit: draft.base_commit.trim(),
+        source_branch: draft.source_branch.trim(), supervisor_profile: "orca",
+      };
+      postMission("/missions", payload, function (result) {
+        const mission = result.mission;
+        setNotice(result.duplicate ? `Duplicate submit collapsed onto ${mission.id}.`
+          : `Mission ${mission.id} dispatched; the source chat stays quiet until a blocker or signed outcome.`);
+        setStatus(null); setSteerTask(""); setSelectedId(mission.id); setDispatchOpen(false);
+        setDraft(function (current) { return Object.assign({}, current, {
+          idempotency_key: newMissionSubmissionKey(), objective: "", acceptance_criteria: "",
+          constraints: "", non_goals: "",
+        }); });
+        return loadMissions();
+      }).finally(function () { submitRef.current = false; });
+    }
+    function steer() {
+      if (!status || !steerTask || !steerText.trim()) return;
+      const mission = status.mission;
+      postMission(`/missions/${encodeURIComponent(mission.id)}/steering`, {
+        task_id: steerTask, source_platform: mission.source.platform,
+        source_chat_id: mission.source.chat_id, source_thread_id: mission.source.thread_id,
+        source_session_id: mission.source.session_id, instruction: steerText.trim(),
+      }, function () { setSteerText(""); setNotice("Steering attached to the scoped mission card."); return loadStatus(mission.id); });
+    }
+    function projectBlocker(taskId) {
+      const id = status.mission.id;
+      postMission(`/missions/${encodeURIComponent(id)}/blockers`, { task_id: taskId }, function (result) {
+        setNotice(result.projected ? "Canonical blocker projected once to the source chat."
+          : "Already projected; no duplicate notification was sent.");
+        return loadStatus(id);
+      });
+    }
+    function completeMission() {
+      if (!status || !finalSummary.trim()) return;
+      let evidence;
+      try { evidence = JSON.parse(finalEvidence); } catch (_e) { setNotice("Evidence must be valid JSON."); return; }
+      if (!evidence || typeof evidence !== "object" || !Object.keys(evidence).length) {
+        setNotice("Evidence must be a non-empty JSON object."); return;
+      }
+      const id = status.mission.id;
+      postMission(`/missions/${encodeURIComponent(id)}/completion`, {
+        signer_profile: "orca", summary: finalSummary.trim(), evidence,
+      }, function (result) {
+        setNotice(result.completed ? "Orca-signed outcome projected once to the source chat."
+          : "Already completed; no duplicate outcome was sent.");
+        return Promise.all([loadStatus(id), loadMissions()]);
+      });
+    }
+    function input(name, required, readOnly) {
+      return h("input", { required: !!required, readOnly: !!readOnly, value: draft[name],
+        onChange: function (e) { draftField(name, e.target.value); } });
+    }
+
+    return h(Card, { className: "hermes-mission-control" }, h(CardContent, { className: "p-0" },
+      h("button", { type: "button", className: "hermes-mission-control__header",
+        onClick: function () { setExpanded(function (value) { return !value; }); } },
+        h("strong", null, "Mission control"),
+        h("span", null, "Source chat: one blocker or one Orca-signed outcome"),
+        h("span", null, expanded ? "▾" : "▸")),
+      expanded ? h("div", { className: "hermes-mission-control__body" },
+        h("div", { className: "hermes-mission-control__actions" },
+          h(Button, { size: "sm", onClick: function () { setDispatchOpen(function (v) { return !v; }); } },
+            dispatchOpen ? "Cancel dispatch" : "Dispatch from source chat"),
+          h(Button, { size: "sm", variant: "outline", onClick: loadMissions }, "Refresh status")),
+        notice ? h("div", { className: "hermes-mission-notice" }, notice) : null,
+        dispatchOpen ? h("form", { className: "hermes-mission-dispatch", onSubmit: dispatchMission },
+          h(MissionField, { label: "Selected project" }, h("select", { required: true, value: draft.project_id,
+            onChange: function (e) { draftField("project_id", e.target.value); } },
+            h("option", { value: "" }, "Choose an explicit Project…"),
+            projects.map(function (p) { return h("option", { key: p.id, value: p.id }, `${p.name} — ${p.primary_path || "no primary repo"}`); }))),
+          h(MissionField, { label: "Canonical repo", hint: "Bound to the Project; never inferred from cwd." },
+            h("input", { readOnly: true, value: project ? (project.primary_path || "") : "" })),
+          h(MissionField, { label: "Platform" }, input("source_platform", true, sourceLocked)),
+          h(MissionField, { label: "Chat ID" }, input("source_chat_id", true, sourceLocked)),
+          h(MissionField, { label: "Thread ID" }, input("source_thread_id", false, sourceLocked)),
+          h(MissionField, { label: "Session ID" }, input("source_session_id", true, sourceLocked)),
+          h(MissionField, { label: "Immutable base commit" }, input("base_commit", true)),
+          h(MissionField, { label: "Source branch" }, input("source_branch", true)),
+          [["objective", "Objective"], ["acceptance_criteria", "Acceptance criteria (one per line)"],
+           ["constraints", "Constraints (one per line)"], ["non_goals", "Non-goals (one per line)"]].map(function (field) {
+            return h(MissionField, { key: field[0], label: field[1], wide: true }, h("textarea", {
+              required: field[0] === "objective" || field[0] === "acceptance_criteria", rows: 3,
+              value: draft[field[0]], onChange: function (e) { draftField(field[0], e.target.value); },
+            }));
+          }),
+          h("div", { className: "hermes-mission-dispatch__submit" },
+            h(Button, { type: "submit", disabled: busy }, busy ? "Dispatching…" : "Create mission receipt"),
+            h("code", null, draft.idempotency_key))) : null,
+        h("div", { className: "hermes-mission-workspace" },
+          h("aside", { className: "hermes-mission-list" }, missions.length ? missions.map(function (mission) {
+            const counts = mission.task_counts || {};
+            return h("button", { key: mission.id, type: "button",
+              className: cn("hermes-mission-list__item", selectedId === mission.id && "is-selected"),
+              onClick: function () {
+                statusRequestRef.current += 1;
+                setStatus(null); setSteerTask(""); setFinalSummary(""); setFinalEvidence("{}");
+                setSelectedId(mission.id);
+              } }, h("strong", null, mission.objective),
+              h("span", null, `${mission.id} · ${mission.status} · ${counts.done || 0}/${counts.total || 0} done`),
+              counts.blocked ? h("em", null, `${counts.blocked} blocked`) : null);
+          }) : h("p", null, "No missions on this board.")),
+          status ? h("section", { className: "hermes-mission-detail" },
+            h("div", { className: "hermes-mission-detail__heading" }, h("div", null,
+              h("h3", null, status.mission.objective), h("p", null, `${status.mission.project_id} · ${status.mission.repo_root}`)),
+              h(Badge, { variant: status.mission.status === "completed" ? "default" : "outline" }, status.mission.status)),
+            h("div", { className: "hermes-mission-receipt" },
+              h("div", null, h("b", null, "Acceptance"), h("ul", null, status.mission.acceptance_criteria.map(function (x, i) { return h("li", { key: i }, x); }))),
+              h("div", null, h("b", null, "Constraints"), h("ul", null, status.mission.constraints.map(function (x, i) { return h("li", { key: i }, x); }))),
+              h("div", null, h("b", null, "Provenance"), h("code", null,
+                `${status.mission.source.platform}:${status.mission.source.chat_id}:${status.mission.source.session_id}`))),
+            h("div", { className: "hermes-mission-tasks" }, status.tasks.map(function (task) {
+              return h("div", { key: task.task_id, className: "hermes-mission-task" },
+                h("button", { type: "button", onClick: function () { props.onOpenTask(task.task_id); } }, task.title),
+                h("span", null, `${task.role} · ${task.assignee || "unassigned"} · ${task.status}`),
+                task.handoff_commit ? h("code", null, task.handoff_commit.slice(0, 12)) : null,
+                task.status === "blocked" ? h(Button, { size: "sm", variant: "outline", disabled: busy,
+                  onClick: function () { projectBlocker(task.task_id); } }, "Project blocker once") : null);
+            })),
+            h("div", { className: "hermes-mission-steer" }, h("select", { value: steerTask,
+              onChange: function (e) { setSteerTask(e.target.value); } }, status.tasks.map(function (task) {
+                return h("option", { key: task.task_id, value: task.task_id }, task.title);
+              })), h("input", { value: steerText, placeholder: "Steer this mission card…",
+                onChange: function (e) { setSteerText(e.target.value); } }),
+              h(Button, { size: "sm", disabled: busy || !steerText.trim(), onClick: steer }, "Steer")),
+            status.steering && status.steering.length ? h("div", { className: "hermes-mission-history" },
+              status.steering.map(function (item, i) { return h("p", { key: i }, h("code", null, item.task_id), " ", item.instruction); })) : null,
+            status.completion ? h("div", { className: "hermes-mission-signed" }, h("b", null, "Orca-signed outcome"),
+              h("p", null, status.completion.summary)) : h("div", { className: "hermes-mission-complete" },
+              h("input", { value: finalSummary, placeholder: "Final outcome summary",
+                onChange: function (e) { setFinalSummary(e.target.value); } }),
+              h("textarea", { rows: 2, value: finalEvidence, placeholder: '{"tests":"passed","commit":"…"}',
+                onChange: function (e) { setFinalEvidence(e.target.value); } }),
+              h(Button, { size: "sm", disabled: busy || !finalSummary.trim(), onClick: completeMission }, "Sign final as Orca")))
+            : h("section", { className: "hermes-mission-detail hermes-mission-detail--empty" }, "Select a mission to inspect cards and evidence.")))
+        : null));
+  }
+
   // -------------------------------------------------------------------------
   // Minimal safe markdown renderer.
   //
@@ -1042,6 +1324,10 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
+        h(MissionControlPanel, {
+          board: board,
+          onOpenTask: setSelectedTaskId,
+        }),
         h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,

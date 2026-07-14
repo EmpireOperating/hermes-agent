@@ -150,6 +150,56 @@ def get_mission(conn: sqlite3.Connection, mission_id: str) -> Optional[dict[str,
     return _mission_dict(row) if row else None
 
 
+def list_missions(
+    conn: sqlite3.Connection,
+    *,
+    project_id: Optional[str] = None,
+    source_session_id: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List receipts without exposing worker-run or retry internals.
+
+    Filters are explicit source/project bindings. There is deliberately no
+    cwd, active-session, or global-project fallback.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project_id:
+        clauses.append("m.project_id = ?")
+        params.append(str(project_id).strip())
+    if source_session_id:
+        clauses.append("m.source_session_id = ?")
+        params.append(str(source_session_id).strip())
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    bounded_limit = max(1, min(int(limit), 500))
+    rows = conn.execute(
+        f"""
+        SELECT m.*,
+               COUNT(mt.task_id) AS task_count,
+               SUM(CASE WHEN t.status = 'blocked' THEN 1 ELSE 0 END) AS blocked_count,
+               SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS done_count
+          FROM kanban_missions m
+          LEFT JOIN kanban_mission_tasks mt ON mt.mission_id = m.id
+          LEFT JOIN tasks t ON t.id = mt.task_id
+          {where}
+         GROUP BY m.id
+         ORDER BY m.created_at DESC, m.id DESC
+         LIMIT ?
+        """,
+        (*params, bounded_limit),
+    ).fetchall()
+    missions: list[dict[str, Any]] = []
+    for row in rows:
+        item = _mission_dict(row)
+        item["task_counts"] = {
+            "total": int(row["task_count"] or 0),
+            "blocked": int(row["blocked_count"] or 0),
+            "done": int(row["done_count"] or 0),
+        }
+        missions.append(item)
+    return missions
+
+
 def create_mission_receipt(
     conn: sqlite3.Connection,
     *,
@@ -625,10 +675,32 @@ def mission_status(conn: sqlite3.Connection, mission_id: str) -> dict[str, Any]:
         "WHERE mission_id = ? AND kind = 'blocker' ORDER BY id",
         (mission_id,),
     ).fetchall()
+    completion_row = conn.execute(
+        "SELECT payload_json FROM kanban_mission_projections "
+        "WHERE mission_id = ? AND kind = 'completion' ORDER BY id DESC LIMIT 1",
+        (mission_id,),
+    ).fetchone()
+    steering_rows = conn.execute(
+        "SELECT task_id, source_session_id, instruction, created_at "
+        "FROM kanban_mission_steering WHERE mission_id = ? ORDER BY id",
+        (mission_id,),
+    ).fetchall()
     return {
         "mission": mission,
         "tasks": tasks,
         "blockers": [_loads(row["payload_json"], {}) for row in blockers],
+        "completion": (
+            _loads(completion_row["payload_json"], {}) if completion_row else None
+        ),
+        "steering": [
+            {
+                "task_id": row["task_id"],
+                "source_session_id": row["source_session_id"],
+                "instruction": row["instruction"],
+                "created_at": row["created_at"],
+            }
+            for row in steering_rows
+        ],
     }
 
 

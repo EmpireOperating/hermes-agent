@@ -1581,3 +1581,63 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Mission control ------------------------------------------------- */
+.hermes-mission-control { overflow: hidden; border-color: color-mix(in srgb, var(--color-ring) 35%, var(--color-border)); }
+.hermes-mission-control__header {
+  width: 100%; display: grid; grid-template-columns: auto 1fr auto; gap: .75rem;
+  align-items: center; padding: .8rem 1rem; border: 0; background: transparent;
+  color: var(--color-foreground); text-align: left; cursor: pointer;
+}
+.hermes-mission-control__header span:nth-child(2) { color: var(--color-muted-foreground); font-size: .75rem; }
+.hermes-mission-control__body { border-top: 1px solid var(--color-border); padding: 1rem; display: grid; gap: .8rem; }
+.hermes-mission-control__actions, .hermes-mission-dispatch__submit,
+.hermes-mission-steer, .hermes-mission-complete { display: flex; align-items: center; gap: .55rem; }
+.hermes-mission-notice { padding: .55rem .7rem; border-radius: var(--radius); background: var(--color-muted); font-size: .75rem; }
+.hermes-mission-dispatch {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .7rem;
+  padding: .85rem; border: 1px solid var(--color-border); border-radius: var(--radius); background: color-mix(in srgb, var(--color-card) 92%, var(--color-muted));
+}
+.hermes-mission-field { display: flex; flex-direction: column; gap: .25rem; font-size: .72rem; color: var(--color-muted-foreground); }
+.hermes-mission-field--wide, .hermes-mission-dispatch__submit { grid-column: 1 / -1; }
+.hermes-mission-field input, .hermes-mission-field select, .hermes-mission-field textarea,
+.hermes-mission-steer input, .hermes-mission-steer select, .hermes-mission-complete input,
+.hermes-mission-complete textarea {
+  min-width: 0; padding: .5rem .6rem; border: 1px solid var(--color-border); border-radius: calc(var(--radius) - 2px);
+  background: var(--color-background); color: var(--color-foreground); font: inherit;
+}
+.hermes-mission-field small { font-size: .65rem; }
+.hermes-mission-dispatch__submit code { overflow-wrap: anywhere; color: var(--color-muted-foreground); font-size: .65rem; }
+.hermes-mission-workspace { display: grid; grid-template-columns: minmax(220px, .38fr) minmax(0, 1fr); gap: .8rem; min-height: 220px; }
+.hermes-mission-list { display: flex; flex-direction: column; gap: .35rem; max-height: 520px; overflow: auto; }
+.hermes-mission-list__item {
+  display: flex; flex-direction: column; gap: .2rem; padding: .65rem; border: 1px solid var(--color-border);
+  border-radius: var(--radius); background: var(--color-card); color: var(--color-foreground); text-align: left; cursor: pointer;
+}
+.hermes-mission-list__item.is-selected { border-color: var(--color-ring); background: color-mix(in srgb, var(--color-ring) 8%, var(--color-card)); }
+.hermes-mission-list__item span, .hermes-mission-list__item em { font-size: .68rem; color: var(--color-muted-foreground); }
+.hermes-mission-list__item em { color: var(--color-destructive); }
+.hermes-mission-detail { display: flex; flex-direction: column; gap: .7rem; min-width: 0; }
+.hermes-mission-detail--empty { align-items: center; justify-content: center; color: var(--color-muted-foreground); font-size: .8rem; }
+.hermes-mission-detail__heading { display: flex; justify-content: space-between; gap: 1rem; align-items: start; }
+.hermes-mission-detail__heading h3, .hermes-mission-detail__heading p { margin: 0; }
+.hermes-mission-detail__heading p { font-size: .68rem; color: var(--color-muted-foreground); overflow-wrap: anywhere; }
+.hermes-mission-receipt { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; font-size: .72rem; }
+.hermes-mission-receipt > div { padding: .55rem; border-radius: var(--radius); background: var(--color-muted); overflow-wrap: anywhere; }
+.hermes-mission-receipt > div:last-child { grid-column: 1 / -1; }
+.hermes-mission-receipt ul { margin: .25rem 0 0; padding-left: 1rem; }
+.hermes-mission-tasks { display: flex; flex-direction: column; gap: .35rem; }
+.hermes-mission-task { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: .5rem; align-items: center; padding: .5rem; border: 1px solid var(--color-border); border-radius: var(--radius); }
+.hermes-mission-task > button:first-child { border: 0; padding: 0; background: transparent; color: var(--color-foreground); text-align: left; cursor: pointer; }
+.hermes-mission-task span, .hermes-mission-task code { font-size: .68rem; color: var(--color-muted-foreground); }
+.hermes-mission-steer input, .hermes-mission-complete input, .hermes-mission-complete textarea { flex: 1; }
+.hermes-mission-history { max-height: 120px; overflow: auto; padding: .5rem; background: var(--color-muted); border-radius: var(--radius); font-size: .7rem; }
+.hermes-mission-history p { margin: .2rem 0; }
+.hermes-mission-signed { padding: .7rem; border: 1px solid color-mix(in srgb, #49a66c 55%, var(--color-border)); border-radius: var(--radius); background: color-mix(in srgb, #49a66c 8%, var(--color-card)); }
+.hermes-mission-signed p { margin: .3rem 0 0; font-size: .8rem; }
+@media (max-width: 820px) {
+  .hermes-mission-workspace, .hermes-mission-dispatch, .hermes-mission-receipt { grid-template-columns: 1fr; }
+  .hermes-mission-field--wide, .hermes-mission-dispatch__submit, .hermes-mission-receipt > div:last-child { grid-column: 1; }
+  .hermes-mission-task { grid-template-columns: 1fr; }
+  .hermes-mission-steer, .hermes-mission-complete { align-items: stretch; flex-direction: column; }
+}

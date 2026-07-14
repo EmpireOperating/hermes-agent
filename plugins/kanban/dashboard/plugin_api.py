@@ -2471,6 +2471,47 @@ def create_mission(payload: MissionReceiptBody, board: Optional[str] = Query(Non
         conn.close()
 
 
+@router.get("/missions")
+def list_missions(
+    project_id: Optional[str] = Query(None),
+    source_session_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {
+            "missions": kanban_missions.list_missions(
+                conn,
+                project_id=project_id,
+                source_session_id=source_session_id,
+                limit=limit,
+            )
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/mission-projects")
+def list_mission_projects():
+    """Return explicit active Projects eligible for mission receipts."""
+    from hermes_cli import projects_db
+
+    with projects_db.connect_closing() as conn:
+        projects = projects_db.list_projects(conn, include_archived=False)
+    return {
+        "projects": [
+            project.to_dict()
+            for project in projects
+            # Mission receipts require one explicit canonical repo root. A
+            # folder-only Project cannot satisfy that contract and presenting
+            # it in the picker creates an option the POST route must reject.
+            if project.primary_path
+        ]
+    }
+
+
 @router.get("/missions/{mission_id}")
 def get_mission_status(mission_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
