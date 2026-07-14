@@ -109,15 +109,46 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
-def _projectable_notification_events(conn, task_id: str, events: list) -> list:
-    """Suppress generic lifecycle noise for subscribed mission roots."""
-    mission_root = conn.execute(
-        "SELECT 1 FROM kanban_mission_tasks "
-        "WHERE task_id = ? AND role = 'root' LIMIT 1",
+def _mission_root_source_binding(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT m.source_platform, m.source_chat_id, m.source_thread_id
+          FROM kanban_mission_tasks mt
+          JOIN kanban_missions m ON m.id = mt.mission_id
+         WHERE mt.task_id = ? AND mt.role = 'root'
+         LIMIT 1
+        """,
         (task_id,),
     ).fetchone()
-    if mission_root is None:
+
+
+def _projectable_notification_events(
+    conn, task_id: str, events: list, sub: Optional[dict] = None
+) -> list:
+    """Suppress generic lifecycle noise for subscribed mission roots.
+
+    Mission roots are source-bound control-plane cards. Even if an old TUI or
+    task-level subscription row still exists for the root, only the immutable
+    receipt's source chat/session may receive explicit mission projections.
+    """
+    source = _mission_root_source_binding(conn, task_id)
+    if source is None:
         return events
+    if sub is not None:
+        requested = (
+            str(sub.get("platform") or ""),
+            str(sub.get("chat_id") or ""),
+            str(sub.get("thread_id") or ""),
+        )
+        canonical = (
+            str(source["source_platform"] or ""),
+            str(source["source_chat_id"] or ""),
+            str(source["source_thread_id"] or ""),
+        )
+        if requested != canonical:
+            return []
     return [
         event for event in events
         if (event.payload or {}).get("mission_projection") is True
@@ -179,7 +210,11 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "mission_started",
+            "mission_stopped",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -251,6 +286,14 @@ class GatewayKanbanWatchersMixin:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
+                            try:
+                                from hermes_cli import kanban_missions as _missions
+                                _missions.project_mission_lifecycle_transitions(conn)
+                            except Exception as exc:
+                                logger.debug(
+                                    "kanban notifier: mission lifecycle projection failed for board %s: %s",
+                                    slug, exc,
+                                )
                             # `connect()` runs the schema + idempotent migration
                             # on first open per process, so an explicit
                             # `init_db()` here would be redundant. Worse:
@@ -317,7 +360,7 @@ class GatewayKanbanWatchersMixin:
                                 # is internal; only explicit atomic mission
                                 # projections may reach the source chat.
                                 events = _projectable_notification_events(
-                                    conn, sub["task_id"], events
+                                    conn, sub["task_id"], events, sub
                                 )
                                 if not events:
                                     continue
@@ -385,7 +428,28 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "mission_started":
+                            payload = ev.payload or {}
+                            mission_id = str(payload.get("mission_id") or sub["task_id"])
+                            mission_title = str(payload.get("title") or title)[:160]
+                            msg = (
+                                f"🟢 {board_tag}Orca has started\n"
+                                f"Mission {mission_id}: {mission_title}\n"
+                                "Open the Orca board for live status and controls."
+                            )
+                        elif kind == "mission_stopped":
+                            payload = ev.payload or {}
+                            mission_id = str(payload.get("mission_id") or sub["task_id"])
+                            mission_title = str(payload.get("title") or title)[:160]
+                            reason = str(payload.get("reason") or payload.get("reason_class") or "stopped")[:200]
+                            next_action = str(payload.get("next_action") or "Open the Orca board for details.")[:200]
+                            msg = (
+                                f"🟠 {board_tag}Orca has stopped\n"
+                                f"Mission {mission_id}: {mission_title}\n"
+                                f"Reason: {reason}\n"
+                                f"Next: {next_action}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -412,12 +476,23 @@ class GatewayKanbanWatchersMixin:
                                 if ev.payload else None
                             )
                             if signoff:
-                                label = (
-                                    "Orca-signoff"
-                                    if str(signoff).casefold() == "orca"
-                                    else f"{signoff}-signoff"
-                                )
-                                msg = f"✅ {label}\n{msg}"
+                                payload = ev.payload or {}
+                                mission_id = payload.get("mission_id")
+                                if mission_id and str(signoff).casefold() == "orca":
+                                    summary = str(payload.get("summary") or "final Orca-signed completion")[:200]
+                                    msg = (
+                                        f"✅ {board_tag}Orca has stopped\n"
+                                        f"Mission {mission_id}: {title}\n"
+                                        f"Reason: final Orca-signed completion\n"
+                                        f"Next: {summary}"
+                                    )
+                                else:
+                                    label = (
+                                        "Orca-signoff"
+                                        if str(signoff).casefold() == "orca"
+                                        else f"{signoff}-signoff"
+                                    )
+                                    msg = f"✅ {label}\n{msg}"
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):

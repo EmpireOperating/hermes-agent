@@ -8562,6 +8562,18 @@ def add_notify_sub(
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
+        if user_id:
+            # Same self-heal for source-chat subscriptions created before the
+            # authenticated source user was persisted on the notification row.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET user_id = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (user_id IS NULL OR user_id = '')
+                """,
+                (user_id, task_id, platform, chat_id, thread_id or ""),
+            )
 
 
 def list_notify_subs(

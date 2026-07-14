@@ -64,6 +64,7 @@ def _receipt(
     session: str,
     project: str,
     supervisor: str = "orca",
+    user_id: str | None = None,
 ):
     with projects_db.connect_closing() as project_conn:
         existing = projects_db.get_project(project_conn, project)
@@ -76,6 +77,9 @@ def _receipt(
             )
         else:
             project = existing.id
+    provenance = {"message_id": f"msg-{session}"}
+    if user_id:
+        provenance["user_id"] = user_id
     return missions.create_mission_receipt(
         conn,
         idempotency_key=key,
@@ -88,7 +92,7 @@ def _receipt(
         acceptance_criteria=["tests pass", "signed completion"],
         constraints=["no deploy"],
         non_goals=["unrelated refactors"],
-        current_chat_provenance={"message_id": f"msg-{session}"},
+        current_chat_provenance=provenance,
         repo_root=str(repo),
         base_commit=base,
         source_branch="main",
@@ -170,6 +174,181 @@ def test_duplicate_dispatch_is_idempotent_and_source_binding_is_immutable(missio
                 session="s1",
                 project="p1",
             )
+
+
+def test_receipt_projects_start_to_authenticated_source_chat_only(mission_env):
+    repo, base = _repo(mission_env / "repo-source-chat")
+    with kb.connect() as conn:
+        mission, duplicate = _receipt(
+            conn,
+            repo,
+            base,
+            key="source-chat",
+            session="miniapp-8578467390-1129",
+            project="p-source",
+            user_id="8578467390",
+        )
+        assert duplicate is False
+        assert not missions.project_mission_start(conn, mission)
+        subs = kb.list_notify_subs(conn, mission["root_task_id"])
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "telegram"
+        assert subs[0]["chat_id"] == "chat-miniapp-8578467390-1129"
+        assert subs[0]["thread_id"] == "topic-1"
+        assert subs[0]["user_id"] == "8578467390"
+        start_events = [
+            event for event in kb.list_events(conn, mission["root_task_id"])
+            if event.kind == "mission_started"
+        ]
+        assert len(start_events) == 1
+        assert start_events[0].payload["mission_id"] == mission["id"]
+        assert start_events[0].payload["mission_projection"] is True
+        assert "old-tui" not in str(subs)
+
+
+def test_duplicate_receipt_repairs_missing_source_subscription_and_start(mission_env):
+    repo, base = _repo(mission_env / "repo-source-repair")
+    with kb.connect() as conn:
+        mission, duplicate = _receipt(
+            conn,
+            repo,
+            base,
+            key="source-repair",
+            session="miniapp-8578467390-1129",
+            project="p-source-repair",
+            user_id="8578467390",
+        )
+        assert duplicate is False
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ?",
+                (mission["root_task_id"],),
+            )
+            conn.execute(
+                "DELETE FROM kanban_mission_projections WHERE mission_id = ? AND kind = 'started'",
+                (mission["id"],),
+            )
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND kind = 'mission_started'",
+                (mission["root_task_id"],),
+            )
+        repaired, duplicate = _receipt(
+            conn,
+            repo,
+            base,
+            key="source-repair",
+            session="miniapp-8578467390-1129",
+            project="p-source-repair",
+            user_id="8578467390",
+        )
+        assert duplicate is True
+        assert repaired["id"] == mission["id"]
+        subs = kb.list_notify_subs(conn, mission["root_task_id"])
+        assert [
+            (sub["platform"], sub["chat_id"], sub["thread_id"], sub["user_id"])
+            for sub in subs
+        ] == [("telegram", "chat-miniapp-8578467390-1129", "topic-1", "8578467390")]
+        assert [
+            event.kind for event in kb.list_events(conn, mission["root_task_id"])
+            if event.kind == "mission_started"
+        ] == ["mission_started"]
+
+
+@pytest.mark.parametrize(
+    ("block_reason", "expected_class"),
+    [
+        ("Need product decision", "blocked"),
+        ("review-required: handoff needs approval", "review_required"),
+    ],
+)
+def test_lifecycle_projects_blocked_and_review_required_stops_once(
+    mission_env, block_reason, expected_class,
+):
+    repo, base = _repo(mission_env / f"repo-{expected_class}")
+    with kb.connect() as conn:
+        mission, _ = _receipt(
+            conn, repo, base, key=f"stop-{expected_class}", session="s", project=f"p-{expected_class}"
+        )
+        child = missions.create_mission_child(
+            conn, mission["id"], title="code", body="code", assignee="worker"
+        )
+        assert kb.block_task(conn, child["task_id"], reason=block_reason)
+        assert missions.project_mission_lifecycle_transitions(conn) == 1
+        assert missions.project_mission_lifecycle_transitions(conn) == 0
+        stopped = [
+            event for event in kb.list_events(conn, mission["root_task_id"])
+            if event.kind == "mission_stopped"
+        ]
+        assert len(stopped) == 1
+        assert stopped[0].payload["reason_class"] == expected_class
+        assert block_reason in stopped[0].payload["reason"]
+
+
+def test_lifecycle_projects_dependency_wait_no_active_worker(mission_env):
+    repo, base = _repo(mission_env / "repo-dependency")
+    with kb.connect() as conn:
+        mission, _ = _receipt(
+            conn, repo, base, key="dependency-stop", session="s", project="p-dep"
+        )
+        child = missions.create_mission_child(
+            conn, mission["id"], title="qa wait", body="wait", assignee="worker"
+        )
+        assert kb.block_task(conn, child["task_id"], reason="waiting for QA", kind="dependency")
+        assert missions.project_mission_lifecycle_transitions(conn) == 1
+        stopped = [
+            event for event in kb.list_events(conn, mission["root_task_id"])
+            if event.kind == "mission_stopped"
+        ]
+        assert stopped[-1].payload["reason_class"] == "dependency_wait"
+        assert "waiting for QA" in stopped[-1].payload["reason"]
+
+
+@pytest.mark.parametrize("failure_kind", ["crashed", "timed_out", "gave_up"])
+def test_lifecycle_projects_failure_stops(mission_env, failure_kind):
+    repo, base = _repo(mission_env / f"repo-{failure_kind}")
+    with kb.connect() as conn:
+        mission, _ = _receipt(
+            conn, repo, base, key=f"failure-{failure_kind}", session="s", project=f"p-{failure_kind}"
+        )
+        child = missions.create_mission_child(
+            conn, mission["id"], title="code", body="code", assignee="worker"
+        )
+        with kb.write_txn(conn):
+            status = "blocked" if failure_kind == "gave_up" else "todo"
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, child["task_id"]))
+            kb._append_event(conn, child["task_id"], failure_kind, {"error": f"{failure_kind} boom"})
+        assert missions.project_mission_lifecycle_transitions(conn) == 1
+        stopped = [
+            event for event in kb.list_events(conn, mission["root_task_id"])
+            if event.kind == "mission_stopped"
+        ]
+        assert stopped[-1].payload["reason_class"] == failure_kind
+        assert f"{failure_kind} boom" in stopped[-1].payload["reason"]
+
+
+def test_lifecycle_resumed_then_stopped_notifies_again(mission_env):
+    repo, base = _repo(mission_env / "repo-resume-stop")
+    with kb.connect() as conn:
+        mission, _ = _receipt(
+            conn, repo, base, key="resume-stop", session="s", project="p-resume"
+        )
+        child = missions.create_mission_child(
+            conn, mission["id"], title="code", body="code", assignee="worker"
+        )
+        assert kb.block_task(conn, child["task_id"], reason="first blocker")
+        assert missions.project_mission_lifecycle_transitions(conn) == 1
+        assert kb.unblock_task(conn, child["task_id"])
+        assert missions.project_mission_lifecycle_transitions(conn) == 0
+        assert kb.block_task(conn, child["task_id"], reason="second blocker")
+        assert missions.project_mission_lifecycle_transitions(conn) == 1
+        stopped = [
+            event for event in kb.list_events(conn, mission["root_task_id"])
+            if event.kind == "mission_stopped"
+        ]
+        assert [event.payload["reason"] for event in stopped] == [
+            "first blocker",
+            "second blocker",
+        ]
 
 
 def test_forced_concurrent_duplicate_dispatch_collapses_to_one_receipt(
@@ -494,6 +673,22 @@ def test_root_generic_completion_and_retry_events_are_not_projectable(
             4, root.id, "completed", {"mission_projection": True}, 4
         )
         assert _projectable_notification_events(conn, root.id, [explicit]) == [explicit]
+        assert _projectable_notification_events(
+            conn,
+            root.id,
+            [explicit],
+            {"platform": "tui", "chat_id": "old-tui-session", "thread_id": ""},
+        ) == []
+        assert _projectable_notification_events(
+            conn,
+            root.id,
+            [explicit],
+            {
+                "platform": "telegram",
+                "chat_id": "chat-s",
+                "thread_id": "topic-1",
+            },
+        ) == [explicit]
 
 
 def test_orca_only_signed_completion_projects_once(mission_env):

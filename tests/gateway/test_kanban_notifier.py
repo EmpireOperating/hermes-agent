@@ -133,6 +133,151 @@ def test_kanban_notifier_marks_orca_supervisor_signoff(tmp_path, monkeypatch):
     assert "reviewed and approved" in adapter.sent[0]["text"]
 
 
+def test_kanban_notifier_delivers_mission_start_stop_messages(tmp_path, monkeypatch):
+    db_path = tmp_path / "mission-lifecycle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        root_id = kb.create_task(conn, title="Mission: ship source chat", assignee="orca")
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_missions (
+                    id, root_task_id, idempotency_key, source_platform,
+                    source_chat_id, source_thread_id, source_session_id, project_id,
+                    objective, acceptance_criteria, constraints_json, non_goals_json,
+                    provenance_json, repo_root, base_commit, source_branch,
+                    dirty_snapshot_json, supervisor_profile, status, created_at
+                ) VALUES (
+                    'm_source', ?, 'source-key', 'telegram',
+                    'miniapp-8578467390-1129', '', 'miniapp-session', 'project',
+                    'ship source chat lifecycle', '[]', '[]', '[]', '{}',
+                    '/repo', 'abc123', 'main', '{}', 'orca', 'active', 1
+                )
+                """,
+                (root_id,),
+            )
+            conn.execute(
+                "INSERT INTO kanban_mission_tasks "
+                "(mission_id, task_id, role, immutable_base_commit, created_at) "
+                "VALUES ('m_source', ?, 'root', 'abc123', 1)",
+                (root_id,),
+            )
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform="telegram",
+            chat_id="miniapp-8578467390-1129",
+            thread_id="",
+            user_id="8578467390",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform="telegram",
+            chat_id="old-tui-session",
+            thread_id="",
+        )
+        kb._append_event(
+            conn,
+            root_id,
+            "mission_started",
+            {
+                "mission_id": "m_source",
+                "title": "ship source chat lifecycle",
+                "mission_projection": True,
+            },
+        )
+        kb._append_event(
+            conn,
+            root_id,
+            "mission_stopped",
+            {
+                "mission_id": "m_source",
+                "title": "ship source chat lifecycle",
+                "reason": "review-required: needs eyes",
+                "next_action": "Review the board handoff and unblock after approval.",
+                "mission_projection": True,
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert [item["chat_id"] for item in adapter.sent] == [
+        "miniapp-8578467390-1129",
+        "miniapp-8578467390-1129",
+    ]
+    assert adapter.sent[0]["text"].startswith("🟢 [default] Orca has started")
+    assert "Mission m_source: ship source chat lifecycle" in adapter.sent[0]["text"]
+    assert adapter.sent[1]["text"].startswith("🟠 [default] Orca has stopped")
+    assert "review-required: needs eyes" in adapter.sent[1]["text"]
+
+
+def test_kanban_notifier_formats_mission_final_signoff_as_stop(tmp_path, monkeypatch):
+    db_path = tmp_path / "mission-final-signoff.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        root_id = kb.create_task(conn, title="Mission: final source chat", assignee="orca")
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_missions (
+                    id, root_task_id, idempotency_key, source_platform,
+                    source_chat_id, source_thread_id, source_session_id, project_id,
+                    objective, acceptance_criteria, constraints_json, non_goals_json,
+                    provenance_json, repo_root, base_commit, source_branch,
+                    dirty_snapshot_json, supervisor_profile, status, created_at
+                ) VALUES (
+                    'm_done', ?, 'done-key', 'telegram',
+                    'miniapp-8578467390-1129', '', 'miniapp-session', 'project',
+                    'final source chat', '[]', '[]', '[]', '{}',
+                    '/repo', 'abc123', 'main', '{}', 'orca', 'completed', 1
+                )
+                """,
+                (root_id,),
+            )
+            conn.execute(
+                "INSERT INTO kanban_mission_tasks "
+                "(mission_id, task_id, role, immutable_base_commit, created_at) "
+                "VALUES ('m_done', ?, 'root', 'abc123', 1)",
+                (root_id,),
+            )
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform="telegram",
+            chat_id="miniapp-8578467390-1129",
+        )
+        kb._append_event(
+            conn,
+            root_id,
+            "completed",
+            {
+                "mission_id": "m_done",
+                "summary": "all acceptance criteria passed",
+                "supervisor_signoff": "orca",
+                "mission_projection": True,
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "miniapp-8578467390-1129"
+    assert adapter.sent[0]["text"].startswith("✅ [default] Orca has stopped")
+    assert "Reason: final Orca-signed completion" in adapter.sent[0]["text"]
+    assert "Next: all acceptance criteria passed" in adapter.sent[0]["text"]
+
+
 def test_kanban_notifier_suppresses_supervisor_retry_failures(
     tmp_path, monkeypatch,
 ):

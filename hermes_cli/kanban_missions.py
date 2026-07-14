@@ -20,6 +20,13 @@ from hermes_cli import kanban_db
 
 
 VALID_MISSION_ROLES = {"root", "code", "integration", "supervisor"}
+ACTIVE_MISSION_TASK_STATUSES = {"running", "ready"}
+
+
+def _fingerprint(*parts: Any) -> str:
+    return hashlib.sha256(
+        "\0".join(str(part or "") for part in parts).encode("utf-8")
+    ).hexdigest()
 
 
 def _required(value: Any, name: str) -> str:
@@ -245,6 +252,7 @@ def create_mission_receipt(
     provenance["session_id"] = session_id
     provenance["chat_id"] = chat_id
     provenance["thread_id"] = source_thread_id or ""
+    source_user_id = str(provenance.get("user_id") or "").strip() or None
 
     repo = _canonical_repo(repo_root)
     selected_project = _canonical_project(project_id, repo)
@@ -261,7 +269,22 @@ def create_mission_receipt(
         requested = (platform, chat_id, source_thread_id or "", session_id, selected_project)
         if binding != requested:
             raise ValueError("idempotency_key is already bound to another source or project")
-        return _mission_dict(existing), True
+        # Idempotent re-acceptance is also the repair path for receipts created
+        # before source-chat lifecycle notifications existed: ensure the
+        # canonical source chat is subscribed and the mission-start projection
+        # exists without relying on any ambient task/TUI subscription.
+        kanban_db.add_notify_sub(
+            conn,
+            task_id=existing["root_task_id"],
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=source_thread_id or "",
+            user_id=source_user_id,
+            notifier_profile=notifier_profile,
+        )
+        receipt = _mission_dict(existing)
+        project_mission_start(conn, receipt)
+        return receipt, True
 
     immutable_base = _commit(repo, base_commit)
     branch_tip = _commit(repo, f"refs/heads/{branch}")
@@ -348,19 +371,24 @@ def create_mission_receipt(
             platform=platform,
             chat_id=chat_id,
             thread_id=source_thread_id or "",
+            user_id=source_user_id,
             notifier_profile=notifier_profile,
         )
-        return _mission_dict(winner), True
+        receipt = _mission_dict(winner)
+        project_mission_start(conn, receipt)
+        return receipt, True
     kanban_db.add_notify_sub(
         conn,
         task_id=root_task_id,
         platform=platform,
         chat_id=chat_id,
         thread_id=source_thread_id or "",
+        user_id=source_user_id,
         notifier_profile=notifier_profile,
     )
     receipt = get_mission(conn, mission_id)
     assert receipt is not None
+    project_mission_start(conn, receipt)
     return receipt, False
 
 
@@ -638,6 +666,195 @@ def project_blocker(
     except sqlite3.IntegrityError:
         return False
     return True
+
+
+def project_mission_start(
+    conn: sqlite3.Connection,
+    mission: dict[str, Any] | str,
+) -> bool:
+    """Project the one source-chat mission-start notification."""
+    if isinstance(mission, str):
+        resolved = get_mission(conn, mission)
+        if resolved is None:
+            raise ValueError(f"unknown mission {mission}")
+        mission = resolved
+    payload = {
+        "mission_id": mission["id"],
+        "root_task_id": mission["root_task_id"],
+        "title": mission["objective"],
+        "status": "active",
+        "mission_projection": True,
+    }
+    now = int(time.time())
+    fingerprint = _fingerprint(mission["id"], "started")
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "INSERT INTO kanban_mission_projections "
+                "(mission_id, task_id, kind, fingerprint, payload_json, created_at) "
+                "VALUES (?, ?, 'started', ?, ?, ?)",
+                (mission["id"], mission["root_task_id"], fingerprint, _json(payload), now),
+            )
+            kanban_db._append_event(
+                conn, mission["root_task_id"], "mission_started", payload,
+            )
+    except sqlite3.IntegrityError:
+        return False
+    return True
+
+
+def _latest_event_for_tasks(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    kinds: Iterable[str],
+) -> Optional[sqlite3.Row]:
+    if not task_ids:
+        return None
+    placeholders = ",".join("?" for _ in task_ids)
+    kind_list = list(kinds)
+    kind_placeholders = ",".join("?" for _ in kind_list)
+    return conn.execute(
+        f"""
+        SELECT * FROM task_events
+         WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})
+         ORDER BY id DESC LIMIT 1
+        """,
+        (*task_ids, *kind_list),
+    ).fetchone()
+
+
+def _mission_stop_candidate(
+    conn: sqlite3.Connection,
+    mission: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT mt.task_id, mt.role, t.title, t.status, t.assignee, t.block_kind,
+               t.consecutive_failures, t.last_failure_error
+          FROM kanban_mission_tasks mt
+          JOIN tasks t ON t.id = mt.task_id
+         WHERE mt.mission_id = ?
+         ORDER BY mt.created_at, mt.task_id
+        """,
+        (mission["id"],),
+    ).fetchall()
+    if not rows:
+        return None
+    task_ids = [row["task_id"] for row in rows]
+    non_root = [row for row in rows if row["role"] != "root"]
+    candidates = non_root or rows
+    if any(row["status"] in ACTIVE_MISSION_TASK_STATUSES for row in candidates):
+        return None
+
+    latest_failure = _latest_event_for_tasks(
+        conn, task_ids, ("gave_up", "crashed", "timed_out"),
+    )
+
+    blocked = [row for row in candidates if row["status"] in {"blocked", "triage", "review"}]
+    if blocked:
+        latest = _latest_event_for_tasks(
+            conn, [row["task_id"] for row in blocked],
+            ("blocked", "block_loop_detected"),
+        )
+        # A circuit-breaker gave_up parks the task in blocked, but semantically
+        # it is a failure stop, not a needs-input block. Prefer it when it is
+        # the newest cause; a later human block should still win.
+        if latest_failure is not None and (
+            latest is None or int(latest_failure["id"]) > int(latest["id"])
+        ):
+            latest = None
+        else:
+            payload = _loads(latest["payload"], {}) if latest else {}
+            reason = str(payload.get("reason") or payload.get("error") or "needs input").strip()
+            reason_class = "review_required" if reason.lower().startswith("review-required:") else "blocked"
+            return {
+                "reason_class": reason_class,
+                "reason": reason,
+                "next_action": (
+                    "Review the board handoff and unblock after approval."
+                    if reason_class == "review_required"
+                    else "Human input is needed on the Orca board."
+                ),
+                "source_task_id": (latest["task_id"] if latest else blocked[0]["task_id"]),
+                "trigger_event_id": int(latest["id"] if latest else 0),
+            }
+
+    if latest_failure is not None:
+        payload = _loads(latest_failure["payload"], {})
+        kind = str(latest_failure["kind"])
+        return {
+            "reason_class": kind,
+            "reason": str(payload.get("error") or payload.get("trigger_outcome") or kind),
+            "next_action": (
+                "Worker stopped after repeated failures; inspect the board and retry or reassign."
+                if kind == "gave_up"
+                else "Dispatcher may retry; inspect the board if no new start follows."
+            ),
+            "source_task_id": latest_failure["task_id"],
+            "trigger_event_id": int(latest_failure["id"]),
+        }
+
+    waiting = [
+        row for row in candidates
+        if row["status"] in {"todo", "scheduled"} or row["block_kind"] == "dependency"
+    ]
+    if waiting:
+        latest_wait = _latest_event_for_tasks(
+            conn, [row["task_id"] for row in waiting],
+            ("dependency_wait", "status", "unblocked"),
+        )
+        payload = _loads(latest_wait["payload"], {}) if latest_wait else {}
+        return {
+            "reason_class": "dependency_wait",
+            "reason": str(payload.get("reason") or "waiting on dependencies / QA; no active worker"),
+            "next_action": "No action needed unless you want to change priority or unblock dependencies.",
+            "source_task_id": (latest_wait["task_id"] if latest_wait else waiting[0]["task_id"]),
+            "trigger_event_id": int(latest_wait["id"] if latest_wait else 0),
+        }
+    return None
+
+
+def project_mission_lifecycle_transitions(conn: sqlite3.Connection) -> int:
+    """Aggregate child task state into mission-level source-chat transitions."""
+    rows = conn.execute(
+        "SELECT * FROM kanban_missions WHERE status = 'active' ORDER BY created_at, id"
+    ).fetchall()
+    projected = 0
+    for row in rows:
+        mission = _mission_dict(row)
+        if project_mission_start(conn, mission):
+            projected += 1
+        candidate = _mission_stop_candidate(conn, mission)
+        if candidate is None:
+            continue
+        fingerprint = _fingerprint(
+            mission["id"], "stopped", candidate["reason_class"],
+            candidate["source_task_id"], candidate["trigger_event_id"],
+        )
+        payload = {
+            "mission_id": mission["id"],
+            "root_task_id": mission["root_task_id"],
+            "title": mission["objective"],
+            "status": "stopped",
+            "mission_projection": True,
+            **candidate,
+        }
+        now = int(time.time())
+        try:
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO kanban_mission_projections "
+                    "(mission_id, task_id, kind, fingerprint, payload_json, created_at) "
+                    "VALUES (?, ?, 'stopped', ?, ?, ?)",
+                    (mission["id"], mission["root_task_id"], fingerprint, _json(payload), now),
+                )
+                kanban_db._append_event(
+                    conn, mission["root_task_id"], "mission_stopped", payload,
+                )
+                projected += 1
+        except sqlite3.IntegrityError:
+            continue
+    return projected
 
 
 def mission_status(conn: sqlite3.Connection, mission_id: str) -> dict[str, Any]:
