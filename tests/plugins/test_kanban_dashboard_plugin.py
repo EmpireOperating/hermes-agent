@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,182 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_path):
+    repo = tmp_path / "mission-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    for key, value in (
+        ("user.email", "mission@example.com"),
+        ("user.name", "Mission API Test"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(repo), "config", key, value],
+            check=True, capture_output=True, text=True,
+        )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "base"],
+        check=True, capture_output=True, text=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    with projects_db.connect_closing() as project_conn:
+        project_id = projects_db.create_project(
+            project_conn,
+            name="Mission API Project",
+            slug="mission-api-project",
+            primary_path=str(repo),
+        )
+    payload = {
+        "idempotency_key": "api-dispatch-1",
+        "source_platform": "telegram",
+        "source_chat_id": "chat-1",
+        "source_thread_id": "topic-1",
+        "source_session_id": "session-1",
+        "project_id": project_id,
+        "objective": "ship scoped mission",
+        "acceptance_criteria": ["API works"],
+        "constraints": ["no deploy"],
+        "non_goals": [],
+        "current_chat_provenance": {"message_id": "message-1"},
+        "repo_root": str(repo),
+        "base_commit": base,
+        "source_branch": "main",
+    }
+    created = client.post("/api/plugins/kanban/missions", json=payload)
+    assert created.status_code == 200, created.text
+    mission = created.json()["mission"]
+    assert created.json()["duplicate"] is False
+
+    duplicate = client.post("/api/plugins/kanban/missions", json=payload)
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate"] is True
+    assert duplicate.json()["mission"]["id"] == mission["id"]
+
+    status = client.get(f"/api/plugins/kanban/missions/{mission['id']}")
+    assert status.status_code == 200
+    assert status.json()["mission"]["source"]["session_id"] == "session-1"
+    assert status.json()["tasks"][0]["role"] == "root"
+
+    rejected = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/steering",
+        json={
+            "task_id": mission["root_task_id"],
+            "source_platform": "telegram",
+            "source_chat_id": "chat-1",
+            "source_thread_id": "topic-1",
+            "source_session_id": "another-session",
+            "instruction": "leak across sessions",
+        },
+    )
+    assert rejected.status_code == 403
+
+    steered = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/steering",
+        json={
+            "task_id": mission["root_task_id"],
+            "source_platform": "telegram",
+            "source_chat_id": "chat-1",
+            "source_thread_id": "topic-1",
+            "source_session_id": "session-1",
+            "instruction": "preserve the declared acceptance criteria",
+        },
+    )
+    assert steered.status_code == 200
+
+    child_response = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/children",
+        json={
+            "title": "Implement mission API",
+            "body": "Commit the scoped implementation",
+            "assignee": "worker",
+            "role": "code",
+        },
+    )
+    assert child_response.status_code == 200, child_response.text
+    allocation = child_response.json()["allocation"]
+
+    with kb.connect() as conn:
+        assert kb.block_task(
+            conn,
+            allocation["task_id"],
+            reason="Need exact API contract",
+            kind="needs_input",
+        )
+    blocker = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/blockers",
+        json={"task_id": allocation["task_id"]},
+    )
+    assert blocker.status_code == 200, blocker.text
+    assert blocker.json()["projected"] is True
+
+    child_worktree = Path(allocation["workspace_path"])
+    (child_worktree / "mission.txt").write_text("done\n", encoding="utf-8")
+    for args in (
+        ("add", "mission.txt"),
+        ("commit", "-m", "implement mission API"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(child_worktree), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    commit_sha = subprocess.run(
+        ["git", "-C", str(child_worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    handoff = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/handoffs",
+        json={
+            "task_id": allocation["task_id"],
+            "commit_sha": commit_sha,
+            "branch_name": allocation["branch_name"],
+            "evidence": {"tests": ["focused: pass"]},
+            "submitted_by": "worker",
+        },
+    )
+    assert handoff.status_code == 200, handoff.text
+    with kb.connect() as conn:
+        assert kb.complete_task(
+            conn,
+            allocation["task_id"],
+            summary="committed handoff",
+            metadata={"commit_sha": commit_sha},
+        )
+
+    rejected_completion = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/completion",
+        json={
+            "signer_profile": "worker",
+            "summary": "not authorized",
+            "evidence": {"tests": ["focused: pass"]},
+        },
+    )
+    assert rejected_completion.status_code == 403
+    completion = client.post(
+        f"/api/plugins/kanban/missions/{mission['id']}/completion",
+        json={
+            "signer_profile": "orca",
+            "summary": "acceptance criteria passed",
+            "evidence": {"tests": ["focused: pass"]},
+        },
+    )
+    assert completion.status_code == 200, completion.text
+    assert completion.json()["completed"] is True
 
 
 def test_orchestration_settings_configure_completion_supervisor(

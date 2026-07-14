@@ -49,6 +49,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_missions
 from hermes_cli import kanban_diagnostics as kd
 
 log = logging.getLogger(__name__)
@@ -2392,6 +2393,183 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 
     # Echo back the resolved state (callers usually re-render from it).
     return get_orchestration_settings()
+
+
+class MissionReceiptBody(BaseModel):
+    idempotency_key: str
+    source_platform: str
+    source_chat_id: str
+    source_thread_id: str = ""
+    source_session_id: str
+    project_id: str
+    objective: str
+    acceptance_criteria: list[str]
+    constraints: list[str] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    current_chat_provenance: dict[str, Any] = Field(default_factory=dict)
+    repo_root: str
+    base_commit: str
+    source_branch: str
+    supervisor_profile: str = "orca"
+    notifier_profile: Optional[str] = None
+
+
+class MissionChildBody(BaseModel):
+    title: str
+    body: str
+    assignee: str
+    role: str = "code"
+    parent_task_ids: list[str] = Field(default_factory=list)
+    priority: int = 0
+
+
+class MissionHandoffBody(BaseModel):
+    task_id: str
+    commit_sha: str
+    branch_name: str
+    evidence: dict[str, Any]
+    submitted_by: str
+
+
+class MissionSteeringBody(BaseModel):
+    task_id: str
+    source_platform: str
+    source_chat_id: str
+    source_thread_id: str = ""
+    source_session_id: str
+    instruction: str
+
+
+class MissionBlockerBody(BaseModel):
+    task_id: str
+
+
+class MissionCompletionBody(BaseModel):
+    signer_profile: str
+    summary: str
+    evidence: dict[str, Any]
+
+
+def _mission_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=403, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/missions")
+def create_mission(payload: MissionReceiptBody, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        receipt, duplicate = kanban_missions.create_mission_receipt(
+            conn, **payload.model_dump()
+        )
+        return {"mission": receipt, "duplicate": duplicate}
+    except (ValueError, PermissionError) as exc:
+        raise _mission_error(exc)
+    finally:
+        conn.close()
+
+
+@router.get("/missions/{mission_id}")
+def get_mission_status(mission_id: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_missions.mission_status(conn, mission_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/missions/{mission_id}/children")
+def create_mission_child(
+    mission_id: str, payload: MissionChildBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"allocation": kanban_missions.create_mission_child(
+            conn, mission_id, **payload.model_dump()
+        )}
+    except (ValueError, PermissionError) as exc:
+        raise _mission_error(exc)
+    finally:
+        conn.close()
+
+
+@router.post("/missions/{mission_id}/handoffs")
+def record_mission_handoff(
+    mission_id: str, payload: MissionHandoffBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        data = payload.model_dump()
+        task_id = data.pop("task_id")
+        return {"handoff": kanban_missions.record_worker_handoff(
+            conn, mission_id, task_id, **data
+        )}
+    except (ValueError, PermissionError) as exc:
+        raise _mission_error(exc)
+    finally:
+        conn.close()
+
+
+@router.post("/missions/{mission_id}/steering")
+def steer_mission(
+    mission_id: str, payload: MissionSteeringBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"steering": kanban_missions.steer_mission(
+            conn, mission_id, **payload.model_dump()
+        )}
+    except (ValueError, PermissionError) as exc:
+        raise _mission_error(exc)
+    finally:
+        conn.close()
+
+
+@router.post("/missions/{mission_id}/blockers")
+def project_mission_blocker(
+    mission_id: str, payload: MissionBlockerBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        projected = kanban_missions.project_blocker(
+            conn, mission_id, **payload.model_dump()
+        )
+        return {"projected": projected}
+    except (ValueError, PermissionError) as exc:
+        raise _mission_error(exc)
+    finally:
+        conn.close()
+
+
+@router.post("/missions/{mission_id}/completion")
+def sign_mission_completion(
+    mission_id: str, payload: MissionCompletionBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        completed = kanban_missions.sign_mission_completion(
+            conn, mission_id, **payload.model_dump()
+        )
+        return {"completed": completed}
+    except (ValueError, PermissionError) as exc:
+        raise _mission_error(exc)
+    finally:
+        conn.close()
 
 
 @router.websocket("/events")

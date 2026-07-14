@@ -1264,6 +1264,73 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Chat-originated, project-scoped missions are an orchestration layer over
+-- canonical Kanban tasks, never a second queue. The receipt is immutable
+-- source/project context; mission_tasks classifies the ordinary task rows.
+CREATE TABLE IF NOT EXISTS kanban_missions (
+    id                    TEXT PRIMARY KEY,
+    root_task_id          TEXT NOT NULL UNIQUE,
+    idempotency_key       TEXT NOT NULL UNIQUE,
+    source_platform       TEXT NOT NULL,
+    source_chat_id        TEXT NOT NULL,
+    source_thread_id      TEXT NOT NULL DEFAULT '',
+    source_session_id     TEXT NOT NULL,
+    project_id            TEXT NOT NULL,
+    objective             TEXT NOT NULL,
+    acceptance_criteria   TEXT NOT NULL,
+    constraints_json      TEXT NOT NULL,
+    non_goals_json        TEXT NOT NULL,
+    provenance_json       TEXT NOT NULL,
+    repo_root             TEXT NOT NULL,
+    base_commit           TEXT NOT NULL,
+    source_branch         TEXT NOT NULL,
+    dirty_snapshot_json   TEXT NOT NULL,
+    supervisor_profile    TEXT NOT NULL DEFAULT 'orca',
+    status                TEXT NOT NULL DEFAULT 'active',
+    created_at            INTEGER NOT NULL,
+    completed_at          INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS kanban_mission_tasks (
+    mission_id              TEXT NOT NULL,
+    task_id                 TEXT NOT NULL UNIQUE,
+    role                    TEXT NOT NULL,
+    immutable_base_commit   TEXT NOT NULL,
+    declared_parent_commits TEXT NOT NULL DEFAULT '[]',
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (mission_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_mission_handoffs (
+    mission_id    TEXT NOT NULL,
+    task_id       TEXT NOT NULL PRIMARY KEY,
+    commit_sha    TEXT NOT NULL,
+    branch_name   TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    submitted_by  TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_mission_steering (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id        TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    instruction       TEXT NOT NULL,
+    created_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_mission_projections (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id   TEXT NOT NULL,
+    task_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    UNIQUE (mission_id, kind, fingerprint)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1274,6 +1341,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_mission_tasks_mission ON kanban_mission_tasks(mission_id);
+CREATE INDEX IF NOT EXISTS idx_mission_handoffs_mission ON kanban_mission_handoffs(mission_id);
+CREATE INDEX IF NOT EXISTS idx_mission_steering_mission ON kanban_mission_steering(mission_id);
 """
 
 
