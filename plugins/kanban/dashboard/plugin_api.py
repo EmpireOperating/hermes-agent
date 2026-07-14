@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_missions
@@ -2445,7 +2445,8 @@ class MissionBlockerBody(BaseModel):
 
 
 class MissionCompletionBody(BaseModel):
-    signer_profile: str
+    model_config = ConfigDict(extra="forbid")
+
     summary: str
     evidence: dict[str, Any]
 
@@ -2600,17 +2601,15 @@ def sign_mission_completion(
     mission_id: str, payload: MissionCompletionBody,
     board: Optional[str] = Query(None),
 ):
-    board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        completed = kanban_missions.sign_mission_completion(
-            conn, mission_id, **payload.model_dump()
-        )
-        return {"completed": completed}
-    except (ValueError, PermissionError) as exc:
-        raise _mission_error(exc)
-    finally:
-        conn.close()
+    # Dashboard authentication proves access to the app, not possession of
+    # the canonical Orca worker identity. Finalization is therefore available
+    # only through the root worker's kanban_complete tool, which binds the
+    # request to its dispatcher-created task_runs row server-side.
+    del mission_id, payload, board
+    raise HTTPException(
+        status_code=403,
+        detail="mission completion requires the canonical Orca root worker run",
+    )
 
 
 @router.websocket("/events")

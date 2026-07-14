@@ -4184,6 +4184,18 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    # Mission roots are control-plane cards. Their source-chat subscription
+    # is reserved for the atomic projection emitted by
+    # ``kanban_missions.sign_mission_completion``. An ordinary completion can
+    # otherwise mark the root done while leaving the receipt active forever.
+    mission_root = conn.execute(
+        "SELECT 1 FROM kanban_mission_tasks "
+        "WHERE task_id = ? AND role = 'root' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if mission_root is not None:
+        return False
+
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -8136,6 +8148,89 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    # Project immutable mission scope from the receipt itself. Child bodies,
+    # cwd, and ambient sessions are caller-controlled and therefore cannot be
+    # the authority for acceptance-critical mission bindings.
+    mission_row = conn.execute(
+        """
+        SELECT m.*, mt.role, mt.immutable_base_commit,
+               mt.declared_parent_commits
+          FROM kanban_mission_tasks mt
+          JOIN kanban_missions m ON m.id = mt.mission_id
+         WHERE mt.task_id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if mission_row is not None:
+        def _mission_json(column: str, fallback):
+            try:
+                return json.loads(mission_row[column])
+            except (TypeError, ValueError):
+                return fallback
+
+        criteria = _mission_json("acceptance_criteria", [])
+        constraints = _mission_json("constraints_json", [])
+        non_goals = _mission_json("non_goals_json", [])
+        provenance = _mission_json("provenance_json", {})
+        dirty = _mission_json("dirty_snapshot_json", {})
+        declared = _mission_json("declared_parent_commits", [])
+        lines.append("## Immutable mission receipt")
+        lines.append(f"Mission: `{mission_row['id']}`")
+        lines.append(f"Role: `{mission_row['role']}`")
+        lines.append(f"Objective: {mission_row['objective']}")
+        lines.append("Acceptance criteria:")
+        lines.extend(f"- {item}" for item in criteria)
+        lines.append("Constraints:")
+        lines.extend(f"- {item}" for item in constraints)
+        if not constraints:
+            lines.append("- (none)")
+        lines.append("Non-goals:")
+        lines.extend(f"- {item}" for item in non_goals)
+        if not non_goals:
+            lines.append("- (none)")
+        lines.append("Source-chat provenance (immutable):")
+        lines.append(_cap(json.dumps({
+            "platform": mission_row["source_platform"],
+            "chat_id": mission_row["source_chat_id"],
+            "thread_id": mission_row["source_thread_id"],
+            "session_id": mission_row["source_session_id"],
+            "provenance": provenance,
+        }, ensure_ascii=False, sort_keys=True)))
+        lines.append("Selected project/repository snapshot (immutable):")
+        lines.append(_cap(json.dumps({
+            "project_id": mission_row["project_id"],
+            "repo_root": mission_row["repo_root"],
+            "base_commit": mission_row["base_commit"],
+            "source_branch": mission_row["source_branch"],
+            "dirty_state_snapshot": dirty,
+        }, ensure_ascii=False, sort_keys=True)))
+        lines.append("")
+        lines.append("## Durable mission handoff contract")
+        if mission_row["role"] == "root":
+            lines.append(
+                "- This is the mission control root. Generic completion is "
+                "rejected; only this canonical Orca run may finalize the "
+                "receipt through `kanban_complete`."
+            )
+            lines.append(
+                "- Independently verify every acceptance criterion and include "
+                "non-empty structured evidence in completion metadata."
+            )
+        else:
+            lines.append(
+                "- Commit all deliverable changes on the allocated branch; "
+                "uncommitted workspace state is not a handoff."
+            )
+            lines.append(
+                "- Record the exact commit SHA, allocated branch, and test/QA "
+                "evidence as the durable mission handoff before completion."
+            )
+            lines.append(
+                f"- Immutable base: `{mission_row['immutable_base_commit']}`; "
+                f"declared parent commits: `{json.dumps(declared, sort_keys=True)}`."
+            )
         lines.append("")
 
     if task.current_step_key == SUPERVISOR_SIGNOFF_STEP:

@@ -612,12 +612,16 @@ def project_blocker(
     ).fetchone()
     canonical_payload = _loads(blocked_event["payload"], {}) if blocked_event else {}
     reason_text = _required(canonical_payload.get("reason"), "canonical blocker reason")
-    fingerprint = hashlib.sha256(f"{task_id}\0{reason_text}".encode()).hexdigest()
+    # Reblocks and internal retries may change wording, but a mission projects
+    # at most one blocker to its source chat. The complete task-event history
+    # remains available in the board audit log.
+    fingerprint = hashlib.sha256(f"{mission_id}\0blocker".encode()).hexdigest()
     payload = {
         "mission_id": mission_id,
         "source_task_id": task_id,
         "reason": reason_text,
         "kind": canonical_payload.get("kind"),
+        "mission_projection": True,
     }
     now = int(time.time())
     try:
@@ -708,19 +712,40 @@ def sign_mission_completion(
     conn: sqlite3.Connection,
     mission_id: str,
     *,
-    signer_profile: str,
+    signer_run_id: int,
     summary: str,
     evidence: dict[str, Any],
 ) -> bool:
-    """Emit the sole final completion projection after Orca signoff."""
+    """Atomically finalize a mission from its canonical Orca root run.
+
+    ``signer_run_id`` is the server-side worker identity supplied by the
+    kanban worker tool, not a caller-asserted profile. A legacy root that was
+    already completed before the projection landed is repaired idempotently.
+    """
     mission = get_mission(conn, mission_id)
     if mission is None:
         raise ValueError(f"unknown mission {mission_id}")
-    signer = kanban_db._canonical_assignee(_required(signer_profile, "signer_profile"))
-    if signer != mission["supervisor_profile"] or signer != "orca":
-        raise PermissionError("mission completion requires canonical Orca signoff")
-    if mission["status"] == "completed":
-        return False
+    root = kanban_db.get_task(conn, mission["root_task_id"])
+    if root is None:
+        raise ValueError("mission root task is missing")
+    canonical_run_id = int(signer_run_id or 0)
+    signer_run = conn.execute(
+        "SELECT id, profile, status, outcome FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (canonical_run_id, mission["root_task_id"]),
+    ).fetchone()
+    signer = kanban_db._canonical_assignee(
+        signer_run["profile"] if signer_run is not None else None
+    )
+    if (
+        signer_run is None
+        or signer != mission["supervisor_profile"]
+        or signer != "orca"
+        or signer_run["status"] not in {"running", "done"}
+    ):
+        raise PermissionError(
+            "mission completion requires the canonical Orca root run"
+        )
     summary_text = _required(summary, "summary")
     if not evidence:
         raise ValueError("completion evidence is required")
@@ -745,32 +770,86 @@ def sign_mission_completion(
     metadata = {
         "mission_id": mission_id,
         "signed_by": signer,
+        "signer_run_id": canonical_run_id,
         "evidence": evidence,
     }
-    completed = kanban_db.complete_task(
-        conn,
-        mission["root_task_id"],
-        result=summary_text,
-        summary=summary_text,
-        metadata=metadata,
-        signoff_profile=signer,
-    )
-    if not completed:
-        return False
     now = int(time.time())
     fingerprint = hashlib.sha256(f"{mission_id}\0completion".encode()).hexdigest()
+    payload = {
+        "summary": summary_text,
+        "supervisor_signoff": signer,
+        "mission_projection": True,
+        **metadata,
+    }
+    projected = False
+    run_id: Optional[int] = canonical_run_id
     with kanban_db.write_txn(conn):
+        durable = conn.execute(
+            "SELECT status FROM kanban_missions WHERE id = ?", (mission_id,)
+        ).fetchone()
+        if durable is None:
+            raise ValueError(f"unknown mission {mission_id}")
+        existing = conn.execute(
+            "SELECT 1 FROM kanban_mission_projections "
+            "WHERE mission_id = ? AND kind = 'completion' LIMIT 1",
+            (mission_id,),
+        ).fetchone()
+        if existing is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'done', result = ?, completed_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                       block_kind = NULL, block_recurrences = 0
+                 WHERE id = ? AND status IN ('running', 'done')
+                   AND current_run_id = ?
+                """,
+                (summary_text, now, mission["root_task_id"], canonical_run_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("canonical Orca root run is no longer finalizable")
+            if root.status == "running":
+                ended = kanban_db._end_run(
+                    conn,
+                    mission["root_task_id"],
+                    outcome="completed",
+                    status="done",
+                    summary=summary_text,
+                    metadata=metadata,
+                )
+                if ended is not None:
+                    run_id = ended
+            conn.execute(
+                "INSERT INTO kanban_mission_projections "
+                "(mission_id, task_id, kind, fingerprint, payload_json, created_at) "
+                "VALUES (?, ?, 'completion', ?, ?, ?)",
+                (
+                    mission_id, mission["root_task_id"], fingerprint,
+                    _json(payload), now,
+                ),
+            )
+            kanban_db._append_event(
+                conn,
+                mission["root_task_id"],
+                "completed",
+                payload,
+                run_id=run_id,
+            )
+            projected = True
         conn.execute(
             "UPDATE kanban_missions SET status = 'completed', completed_at = ? WHERE id = ?",
             (now, mission_id),
         )
-        conn.execute(
-            "INSERT OR IGNORE INTO kanban_mission_projections "
-            "(mission_id, task_id, kind, fingerprint, payload_json, created_at) "
-            "VALUES (?, ?, 'completion', ?, ?, ?)",
-            (
-                mission_id, mission["root_task_id"], fingerprint,
-                _json({"summary": summary_text, **metadata}), now,
-            ),
+    kanban_db._clear_failure_counter(conn, mission["root_task_id"])
+    kanban_db.recompute_ready(conn)
+    kanban_db._cleanup_workspace(conn, mission["root_task_id"])
+    if projected:
+        kanban_db._fire_kanban_lifecycle_hook(
+            "kanban_task_completed",
+            mission["root_task_id"],
+            board=kanban_db.get_current_board(),
+            assignee=signer,
+            run_id=run_id,
+            summary=summary_text,
         )
-    return True
+    return projected

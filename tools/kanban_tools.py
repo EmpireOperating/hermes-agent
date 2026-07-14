@@ -758,6 +758,39 @@ def _handle_complete(args: dict, **kw) -> str:
                         metadata["artifacts"] = submitted_artifacts
                 metadata["supervisor_signoff"] = task.assignee
 
+            # Mission control roots finalize through their dedicated atomic
+            # receipt/projection transaction. The signer identity comes from
+            # this worker's canonical run row, never caller-authored metadata.
+            mission_root = conn.execute(
+                "SELECT mission_id FROM kanban_mission_tasks "
+                "WHERE task_id = ? AND role = 'root' LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if mission_root is not None:
+                try:
+                    from hermes_cli import kanban_missions
+
+                    ok = kanban_missions.sign_mission_completion(
+                        conn,
+                        mission_root["mission_id"],
+                        signer_run_id=_worker_run_id(tid),
+                        summary=summary or result or "",
+                        evidence=dict(metadata or {}),
+                    )
+                except (ValueError, PermissionError) as mission_exc:
+                    return tool_error(f"kanban_complete: {mission_exc}")
+                if not ok:
+                    return tool_error(
+                        f"could not complete {tid} (mission already projected)"
+                    )
+                return _ok(
+                    task_id=tid,
+                    run_id=_worker_run_id(tid),
+                    status="done",
+                    supervisor_signoff=task.assignee,
+                    mission_id=mission_root["mission_id"],
+                )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,

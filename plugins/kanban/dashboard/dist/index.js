@@ -305,8 +305,6 @@
     const [notice, setNotice] = useState("");
     const [steerTask, setSteerTask] = useState("");
     const [steerText, setSteerText] = useState("");
-    const [finalSummary, setFinalSummary] = useState("");
-    const [finalEvidence, setFinalEvidence] = useState("{}");
     const submitRef = useRef(false);
     const statusRequestRef = useRef(0);
     const [draft, setDraft] = useState(function () { return {
@@ -360,7 +358,6 @@
       // mission across a board/project switch.
       statusRequestRef.current += 1;
       setMissions([]); setSelectedId(""); setStatus(null); setSteerTask("");
-      setFinalSummary(""); setFinalEvidence("{}");
     }, [props.board]);
     useEffect(function () {
       if (!expanded || !selectedId) return undefined;
@@ -438,22 +435,7 @@
         return loadStatus(id);
       });
     }
-    function completeMission() {
-      if (!status || !finalSummary.trim()) return;
-      let evidence;
-      try { evidence = JSON.parse(finalEvidence); } catch (_e) { setNotice("Evidence must be valid JSON."); return; }
-      if (!evidence || typeof evidence !== "object" || !Object.keys(evidence).length) {
-        setNotice("Evidence must be a non-empty JSON object."); return;
-      }
-      const id = status.mission.id;
-      postMission(`/missions/${encodeURIComponent(id)}/completion`, {
-        signer_profile: "orca", summary: finalSummary.trim(), evidence,
-      }, function (result) {
-        setNotice(result.completed ? "Orca-signed outcome projected once to the source chat."
-          : "Already completed; no duplicate outcome was sent.");
-        return Promise.all([loadStatus(id), loadMissions()]);
-      });
-    }
+
     function input(name, required, readOnly) {
       return h("input", { required: !!required, readOnly: !!readOnly, value: draft[name],
         onChange: function (e) { draftField(name, e.target.value); } });
@@ -501,7 +483,7 @@
               className: cn("hermes-mission-list__item", selectedId === mission.id && "is-selected"),
               onClick: function () {
                 statusRequestRef.current += 1;
-                setStatus(null); setSteerTask(""); setFinalSummary(""); setFinalEvidence("{}");
+                setStatus(null); setSteerTask("");
                 setSelectedId(mission.id);
               } }, h("strong", null, mission.objective),
               h("span", null, `${mission.id} · ${mission.status} · ${counts.done || 0}/${counts.total || 0} done`),
@@ -534,11 +516,7 @@
               status.steering.map(function (item, i) { return h("p", { key: i }, h("code", null, item.task_id), " ", item.instruction); })) : null,
             status.completion ? h("div", { className: "hermes-mission-signed" }, h("b", null, "Orca-signed outcome"),
               h("p", null, status.completion.summary)) : h("div", { className: "hermes-mission-complete" },
-              h("input", { value: finalSummary, placeholder: "Final outcome summary",
-                onChange: function (e) { setFinalSummary(e.target.value); } }),
-              h("textarea", { rows: 2, value: finalEvidence, placeholder: '{"tests":"passed","commit":"…"}',
-                onChange: function (e) { setFinalEvidence(e.target.value); } }),
-              h(Button, { size: "sm", disabled: busy || !finalSummary.trim(), onClick: completeMission }, "Sign final as Orca")))
+              "Awaiting signed completion from the canonical Orca root worker."))
             : h("section", { className: "hermes-mission-detail hermes-mission-detail--empty" }, "Select a mission to inspect cards and evidence.")))
         : null));
   }

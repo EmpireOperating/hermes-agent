@@ -61,6 +61,18 @@ def client(kanban_home):
     return TestClient(app)
 
 
+@pytest.fixture
+def canonical_client(kanban_home):
+    """Exercise the plugin through the real dashboard app and auth gate."""
+    from hermes_cli import web_server
+
+    return TestClient(
+        web_server.app,
+        base_url="http://localhost",
+        headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
@@ -79,6 +91,34 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_canonical_dashboard_mount_requires_auth_and_cannot_impersonate_orca(
+    canonical_client,
+):
+    from hermes_cli import web_server
+
+    with TestClient(web_server.app, base_url="http://localhost") as unauthenticated:
+        denied = unauthenticated.get("/api/plugins/kanban/board")
+    assert denied.status_code == 401
+
+    mounted = canonical_client.get("/api/plugins/kanban/board")
+    assert mounted.status_code == 200
+    completion = canonical_client.post(
+        "/api/plugins/kanban/missions/not-a-worker/completion",
+        json={"summary": "forged", "evidence": {"tests": "forged"}},
+    )
+    assert completion.status_code == 403
+    assert "canonical Orca root worker run" in completion.json()["detail"]
+    asserted_profile = canonical_client.post(
+        "/api/plugins/kanban/missions/not-a-worker/completion",
+        json={
+            "signer_profile": "orca",
+            "summary": "forged",
+            "evidence": {"tests": "forged"},
+        },
+    )
+    assert asserted_profile.status_code == 422
 
 
 def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_path):
@@ -265,13 +305,12 @@ def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_pat
     rejected_completion = client.post(
         f"/api/plugins/kanban/missions/{mission['id']}/completion",
         json={
-            "signer_profile": "worker",
             "summary": "not authorized",
             "evidence": {"tests": ["focused: pass"]},
         },
     )
     assert rejected_completion.status_code == 403
-    completion = client.post(
+    forged_completion = client.post(
         f"/api/plugins/kanban/missions/{mission['id']}/completion",
         json={
             "signer_profile": "orca",
@@ -279,19 +318,9 @@ def test_mission_control_room_receipt_status_and_scoped_steering(client, tmp_pat
             "evidence": {"tests": ["focused: pass"]},
         },
     )
-    assert completion.status_code == 200, completion.text
-    assert completion.json()["completed"] is True
-    duplicate_completion = client.post(
-        f"/api/plugins/kanban/missions/{mission['id']}/completion",
-        json={
-            "signer_profile": "orca",
-            "summary": "must not duplicate",
-            "evidence": {"tests": ["focused: pass"]},
-        },
-    )
-    assert duplicate_completion.json()["completed"] is False
+    assert forged_completion.status_code == 422
     final_status = client.get(f"/api/plugins/kanban/missions/{mission['id']}").json()
-    assert final_status["completion"]["summary"] == "acceptance criteria passed"
+    assert final_status["completion"] is None
 
 
 def test_dashboard_mission_control_uses_scoped_idempotent_seams():
@@ -312,11 +341,12 @@ def test_dashboard_mission_control_uses_scoped_idempotent_seams():
     assert "source_session_id: mission.source.session_id" in bundle
     assert "Never carry a selected" in bundle
     assert 'setMissions([]); setSelectedId(""); setStatus(null); setSteerTask("")' in bundle
-    assert 'setFinalSummary(""); setFinalEvidence("{}")' in bundle
+    assert "setFinalSummary" not in bundle
+    assert "setFinalEvidence" not in bundle
     assert "Project blocker once" in bundle
-    assert 'signer_profile: "orca"' in bundle
+    assert 'signer_profile: "orca"' not in bundle
+    assert "canonical Orca root worker" in bundle
     assert "no duplicate notification was sent" in bundle
-    assert "no duplicate outcome was sent" in bundle
     # The control-room list consumes mission summaries, not task run/retry rows.
     assert "`${API}/missions`" in bundle
     assert "task_runs" not in bundle

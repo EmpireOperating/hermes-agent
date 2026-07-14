@@ -109,6 +109,21 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _projectable_notification_events(conn, task_id: str, events: list) -> list:
+    """Suppress generic lifecycle noise for subscribed mission roots."""
+    mission_root = conn.execute(
+        "SELECT 1 FROM kanban_mission_tasks "
+        "WHERE task_id = ? AND role = 'root' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if mission_root is None:
+        return events
+    return [
+        event for event in events
+        if (event.payload or {}).get("mission_projection") is True
+    ]
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -297,6 +312,15 @@ class GatewayKanbanWatchersMixin:
                                         )
                                     )
                                 ]
+                                # Mission roots are control-plane cards. Their
+                                # generic crash/retry/block/complete lifecycle
+                                # is internal; only explicit atomic mission
+                                # projections may reach the source chat.
+                                events = _projectable_notification_events(
+                                    conn, sub["task_id"], events
+                                )
+                                if not events:
+                                    continue
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
