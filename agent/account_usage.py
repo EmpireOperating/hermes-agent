@@ -436,6 +436,20 @@ def _resolve_codex_usage_url(base_url: str) -> str:
     return normalized + "/api/codex/usage"
 
 
+def _codex_window_label(key: str, window: dict[str, Any]) -> str:
+    """Name Codex quota windows by their actual duration, not API slot order."""
+    duration = window.get("limit_window_seconds")
+    try:
+        seconds = int(duration) if isinstance(duration, (int, float, str)) else 0
+    except ValueError:
+        seconds = 0
+    if seconds and seconds <= 24 * 60 * 60:
+        return "5h"
+    if seconds >= 6 * 24 * 60 * 60:
+        return "7d"
+    return "5h" if key == "primary_window" else "7d"
+
+
 def _fetch_codex_account_usage() -> Optional[AccountUsageSnapshot]:
     creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
     token_data = _read_codex_tokens()
@@ -454,14 +468,14 @@ def _fetch_codex_account_usage() -> Optional[AccountUsageSnapshot]:
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key in ("primary_window", "secondary_window"):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
         windows.append(
             AccountUsageWindow(
-                label=label,
+                label=_codex_window_label(key, window),
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
             )
