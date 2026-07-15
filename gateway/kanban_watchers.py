@@ -618,7 +618,15 @@ class GatewayKanbanWatchersMixin:
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = {
+                            ev.kind for ev in d["events"]
+                            if ev.kind in _WAKE_KINDS
+                            # Mission projections are already the source-chat
+                            # contract: the concise send() text is the whole
+                            # notification. Do not also inject a generic
+                            # internal kanban wake into the same source chat.
+                            and not (ev.payload or {}).get("mission_projection")
+                        }
                         if _wake_kinds:
                             try:
                                 _session_key = getattr(task, "session_id", None) or ""

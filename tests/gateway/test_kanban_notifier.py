@@ -10,9 +10,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled_messages = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled_messages.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -223,7 +227,12 @@ def test_kanban_notifier_formats_mission_final_signoff_as_stop(tmp_path, monkeyp
     kb.init_db()
     conn = kb.connect()
     try:
-        root_id = kb.create_task(conn, title="Mission: final source chat", assignee="orca")
+        root_id = kb.create_task(
+            conn,
+            title="Mission: final source chat",
+            assignee="orca",
+            session_id="miniapp-session",
+        )
         with kb.write_txn(conn):
             conn.execute(
                 """
@@ -276,6 +285,7 @@ def test_kanban_notifier_formats_mission_final_signoff_as_stop(tmp_path, monkeyp
     assert adapter.sent[0]["text"].startswith("✅ [default] Orca has stopped")
     assert "Reason: final Orca-signed completion" in adapter.sent[0]["text"]
     assert "Next: all acceptance criteria passed" in adapter.sent[0]["text"]
+    assert adapter.handled_messages == []
 
 
 def test_kanban_notifier_suppresses_supervisor_retry_failures(
