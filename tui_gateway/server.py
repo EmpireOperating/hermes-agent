@@ -1475,10 +1475,11 @@ def _normalize_browser_action_request(action: Any) -> tuple[dict | None, str | N
     if action_type == "openUrl" and not safe_url:
         return None, "restricted_url"
 
+    trace_request_id = _clean_browser_action_string(
+        action.get("requestId") or action.get("request_id"), 120
+    )
     normalized = {
-        "requestId": _clean_browser_action_string(
-            action.get("requestId") or action.get("request_id"), 120
-        ),
+        "traceRequestId": trace_request_id,
         "type": action_type,
         "url": safe_url,
         "target": target,
@@ -1488,6 +1489,28 @@ def _normalize_browser_action_request(action: Any) -> tuple[dict | None, str | N
         "requiresApproval": action_type in _BROWSER_MUTATING_ACTIONS,
     }
     return {k: v for k, v in normalized.items() if v not in ("", None)}, None
+
+
+def _browser_action_request_id(pending: dict) -> str:
+    """Return a server-owned browser-action request id not active in *pending*."""
+    for _ in range(8):
+        request_id = uuid.uuid4().hex
+        existing = pending.get(request_id)
+        if not (isinstance(existing, dict) and existing.get("status") == "requested"):
+            return request_id
+    # UUID collisions should be impossible in practice; keep a deterministic
+    # failure mode if tests monkeypatch uuid into a constant active id.
+    raise RuntimeError("could not allocate browser action request id")
+
+
+def _browser_action_result_token() -> str:
+    """Return an unguessable bearer token for one browser-action result ack."""
+    return uuid.uuid4().hex + uuid.uuid4().hex
+
+
+def _browser_action_extension_context(session: dict) -> str:
+    """Return the server-owned extension context id for this session/request."""
+    return session.setdefault("browser_action_extension_context", uuid.uuid4().hex)
 
 
 def _summarize_browser_action_result(result: Any) -> dict:
@@ -1545,15 +1568,6 @@ def _prune_browser_action_requests(session: dict, now: float | None = None) -> d
     return requests
 
 
-def _find_browser_action_request(request_id: str) -> tuple[str, dict, dict] | None:
-    for session_id, candidate in _sessions.items():
-        requests = _prune_browser_action_requests(candidate)
-        record = requests.get(request_id)
-        if record is not None:
-            return session_id, candidate, record
-    return None
-
-
 def _browser_action_request_tool_callback(
     sid: str,
     *,
@@ -1562,12 +1576,11 @@ def _browser_action_request_tool_callback(
     timeout: float = 300,
 ) -> str:
     """Bridge the model-facing browser_action_request tool to browser.action RPCs."""
-    request_id = _clean_browser_action_string(action.get("requestId") or action.get("request_id"), 120) or uuid.uuid4().hex
     rpc = handle_request(
         {
-            "id": f"browser-action-tool-{request_id}",
+            "id": f"browser-action-tool-{uuid.uuid4().hex}",
             "method": "browser.action.request",
-            "params": {"session_id": sid, "request_id": request_id, "action": action},
+            "params": {"session_id": sid, "action": action},
         }
     )
     if not isinstance(rpc, dict) or rpc.get("error"):
@@ -1577,14 +1590,22 @@ def _browser_action_request_tool_callback(
             {
                 "ok": False,
                 "status": "failed",
-                "request_id": request_id,
                 "reason": error_message or "browser action request failed",
             },
             ensure_ascii=False,
         )
 
     result = rpc.get("result") or {}
-    request_id = str(result.get("request_id") or request_id)
+    request_id = str(result.get("request_id") or "")
+    if not request_id:
+        return json.dumps(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "browser action request missing server request id",
+            },
+            ensure_ascii=False,
+        )
     if not wait_for_result:
         return json.dumps({"ok": True, **result}, ensure_ascii=False)
 
@@ -8443,27 +8464,45 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     action, reason = _normalize_browser_action_request(params.get("action") or params)
     if reason or action is None:
         return _err(rid, 4002, reason or "invalid_action")
-    request_id = _clean_browser_action_string(
-        params.get("request_id") or params.get("requestId") or action.get("requestId"),
+    trace_request_id = _clean_browser_action_string(
+        params.get("request_id") or params.get("requestId") or action.get("traceRequestId"),
         120,
-    ) or uuid.uuid4().hex
-    action = {**action, "requestId": request_id}
+    )
+    if trace_request_id:
+        action = {**action, "traceRequestId": trace_request_id}
     pending = _prune_browser_action_requests(session)
-    existing = pending.get(request_id)
-    if isinstance(existing, dict) and existing.get("status") == "requested":
-        return _err(rid, 4002, "request_id already pending")
+    try:
+        request_id = _browser_action_request_id(pending)
+    except RuntimeError as exc:
+        return _err(rid, 5000, str(exc))
+    action = {**action, "requestId": request_id}
     pending_count = sum(1 for record in pending.values() if record.get("status") == "requested")
     if pending_count >= _BROWSER_ACTION_MAX_PENDING:
         return _err(rid, 4290, "too many pending browser action requests")
+    result_token = _browser_action_result_token()
+    extension_context = _browser_action_extension_context(session)
     pending[request_id] = {
         "action": action,
         "created_at": time.time(),
+        "extension_context": extension_context,
+        "result_token": result_token,
         "status": "requested",
+        "transport": current_transport() or session.get("transport"),
     }
-    _emit("browser.action.requested", str(params.get("session_id") or ""), {"request_id": request_id, "action": action})
+    _emit(
+        "browser.action.requested",
+        str(params.get("session_id") or ""),
+        {
+            "request_id": request_id,
+            "action": action,
+            "extension_context": extension_context,
+            "result_token": result_token,
+        },
+    )
     return _ok(rid, {"status": "requested", "request_id": request_id, "action": action})
 
 
@@ -8474,19 +8513,35 @@ def _(rid, params: dict) -> dict:
     if not request_id:
         return _err(rid, 4002, "request_id is required")
     session_id = str(params.get("session_id") or "").strip()
+    if not session_id:
+        return _err(rid, 4002, "session_id is required")
+    session = _sessions.get(session_id)
     found = None
-    if session_id:
-        session = _sessions.get(session_id)
-        if session is not None:
-            requests = _prune_browser_action_requests(session)
-            record = requests.get(request_id)
-            if record is not None:
-                found = (session_id, session, record)
-    else:
-        found = _find_browser_action_request(request_id)
+    if session is not None:
+        requests = _prune_browser_action_requests(session)
+        record = requests.get(request_id)
+        if record is not None:
+            found = (session_id, session, record)
     if found is None:
         return _err(rid, 4001, "browser action request not found")
     session_id, session, record = found
+
+    expected_token = _clean_browser_action_string(record.get("result_token"), 160)
+    supplied_token = _clean_browser_action_string(
+        params.get("result_token") or params.get("resultToken"), 160
+    )
+    if not expected_token or supplied_token != expected_token:
+        return _err(rid, 4001, "browser action request not found")
+    expected_context = _clean_browser_action_string(record.get("extension_context"), 120)
+    supplied_context = _clean_browser_action_string(
+        params.get("extension_context") or params.get("extensionContext"), 120
+    )
+    if expected_context and supplied_context != expected_context:
+        return _err(rid, 4001, "browser action request not found")
+    owner_transport = record.get("transport")
+    active_transport = current_transport()
+    if owner_transport is not None and active_transport is not owner_transport:
+        return _err(rid, 4001, "browser action request not found")
 
     result = _summarize_browser_action_result(params.get("result"))
     if record.get("status") != "requested":

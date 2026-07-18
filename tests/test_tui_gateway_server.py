@@ -4722,15 +4722,25 @@ def test_browser_action_request_emits_validated_event(monkeypatch):
 
     assert session is not None
     assert resp["result"]["status"] == "requested"
-    assert resp["result"]["request_id"] == "req-1"
+    assert resp["result"]["request_id"] != "req-1"
     assert resp["result"]["action"]["url"] == "https://docs.example/"
     assert resp["result"]["action"]["requiresApproval"] is True
-    assert session["browser_action_requests"]["req-1"]["status"] == "requested"
+    assert resp["result"]["action"]["requestId"] == resp["result"]["request_id"]
+    assert resp["result"]["action"]["traceRequestId"] == "req-1"
+    record = session["browser_action_requests"][resp["result"]["request_id"]]
+    assert record["status"] == "requested"
+    assert record["result_token"]
+    assert record["extension_context"]
     assert events == [
         (
             "browser.action.requested",
             "sid",
-            {"request_id": "req-1", "action": resp["result"]["action"]},
+            {
+                "request_id": resp["result"]["request_id"],
+                "action": resp["result"]["action"],
+                "extension_context": record["extension_context"],
+                "result_token": record["result_token"],
+            },
         )
     ]
 
@@ -4762,18 +4772,18 @@ def test_browser_action_request_rejects_restricted_and_unsupported_actions():
     assert unsupported["error"]["message"] == "unsupported_action"
 
 
-def test_browser_action_request_rejects_duplicate_and_caps_pending():
+def test_browser_action_request_ignores_caller_id_and_caps_pending():
     server._sessions["sid"] = _session(
         browser_action_requests={
             "existing": {"status": "requested", "created_at": 1000, "action": {"type": "scroll"}},
             **{
                 f"req-{idx}": {"status": "requested", "created_at": 1000, "action": {"type": "scroll"}}
-                for idx in range(server._BROWSER_ACTION_MAX_PENDING - 1)
+                for idx in range(server._BROWSER_ACTION_MAX_PENDING - 2)
             },
         }
     )
     try:
-        duplicate = server.handle_request(
+        ignored_caller_id = server.handle_request(
             {
                 "id": "1",
                 "method": "browser.action.request",
@@ -4798,7 +4808,8 @@ def test_browser_action_request_rejects_duplicate_and_caps_pending():
     finally:
         server._sessions.pop("sid", None)
 
-    assert duplicate["error"]["message"] == "request_id already pending"
+    assert ignored_caller_id["result"]["request_id"] != "existing"
+    assert ignored_caller_id["result"]["action"]["traceRequestId"] == "existing"
     assert capped["error"]["code"] == 4290
     assert capped["error"]["message"] == "too many pending browser action requests"
 
@@ -4810,6 +4821,8 @@ def test_browser_action_result_expires_stale_pending_requests(monkeypatch):
             "old": {
                 "status": "requested",
                 "created_at": 2000.0 - server._BROWSER_ACTION_PENDING_TTL_SECONDS - 1,
+                "extension_context": "ctx-a",
+                "result_token": "tok-a",
                 "action": {"type": "scroll"},
             }
         }
@@ -4819,7 +4832,13 @@ def test_browser_action_result_expires_stale_pending_requests(monkeypatch):
             {
                 "id": "1",
                 "method": "browser.action.result",
-                "params": {"request_id": "old", "result": {"ok": True, "actionType": "scroll"}},
+                "params": {
+                    "session_id": "sid",
+                    "request_id": "old",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-a",
+                    "result": {"ok": True, "actionType": "scroll"},
+                },
             }
         )
         session = server._sessions["sid"]
@@ -4834,8 +4853,20 @@ def test_browser_action_result_expires_stale_pending_requests(monkeypatch):
 def test_browser_action_result_records_denied_and_blocked_statuses():
     server._sessions["sid"] = _session(
         browser_action_requests={
-            "deny": {"status": "requested", "created_at": 1000, "action": {"type": "click"}},
-            "block": {"status": "requested", "created_at": 1000, "action": {"type": "openUrl"}},
+            "deny": {
+                "status": "requested",
+                "created_at": 1000,
+                "extension_context": "ctx-a",
+                "result_token": "tok-a",
+                "action": {"type": "click"},
+            },
+            "block": {
+                "status": "requested",
+                "created_at": 1000,
+                "extension_context": "ctx-a",
+                "result_token": "tok-b",
+                "action": {"type": "openUrl"},
+            },
         }
     )
     try:
@@ -4843,14 +4874,26 @@ def test_browser_action_result_records_denied_and_blocked_statuses():
             {
                 "id": "1",
                 "method": "browser.action.result",
-                "params": {"request_id": "deny", "result": {"ok": False, "reason": "denied_by_user"}},
+                "params": {
+                    "session_id": "sid",
+                    "request_id": "deny",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-a",
+                    "result": {"ok": False, "reason": "denied_by_user"},
+                },
             }
         )
         blocked = server.handle_request(
             {
                 "id": "2",
                 "method": "browser.action.result",
-                "params": {"request_id": "block", "result": {"ok": False, "reason": "restricted_url"}},
+                "params": {
+                    "session_id": "sid",
+                    "request_id": "block",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-b",
+                    "result": {"ok": False, "reason": "restricted_url"},
+                },
             }
         )
         session = server._sessions["sid"]
@@ -4870,7 +4913,12 @@ def test_browser_action_result_records_ack_without_echoing_data_url(monkeypatch)
     )
     server._sessions["sid"] = _session(
         browser_action_requests={
-            "req-1": {"status": "requested", "action": {"type": "screenshot"}}
+            "req-1": {
+                "status": "requested",
+                "extension_context": "ctx-a",
+                "result_token": "tok-a",
+                "action": {"type": "screenshot"},
+            }
         }
     )
     try:
@@ -4879,7 +4927,10 @@ def test_browser_action_result_records_ack_without_echoing_data_url(monkeypatch)
                 "id": "1",
                 "method": "browser.action.result",
                 "params": {
+                    "session_id": "sid",
                     "request_id": "req-1",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-a",
                     "result": {
                         "ok": True,
                         "actionType": "screenshot",
@@ -4913,6 +4964,131 @@ def test_browser_action_result_records_ack_without_echoing_data_url(monkeypatch)
     ]
 
 
+def test_browser_action_result_requires_owning_session_and_token():
+    server._sessions["sid-a"] = _session(
+        browser_action_requests={
+            "req-a": {
+                "status": "requested",
+                "extension_context": "ctx-a",
+                "result_token": "tok-a",
+                "action": {"type": "scroll"},
+            }
+        }
+    )
+    server._sessions["sid-b"] = _session()
+    try:
+        no_session = server.handle_request(
+            {
+                "id": "no-session",
+                "method": "browser.action.result",
+                "params": {
+                    "request_id": "req-a",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-a",
+                    "result": {"ok": True, "actionType": "scroll"},
+                },
+            }
+        )
+        cross_session = server.handle_request(
+            {
+                "id": "cross-session",
+                "method": "browser.action.result",
+                "params": {
+                    "session_id": "sid-b",
+                    "request_id": "req-a",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-a",
+                    "result": {"ok": True, "actionType": "scroll"},
+                },
+            }
+        )
+        wrong_token = server.handle_request(
+            {
+                "id": "wrong-token",
+                "method": "browser.action.result",
+                "params": {
+                    "session_id": "sid-a",
+                    "request_id": "req-a",
+                    "extension_context": "ctx-a",
+                    "result_token": "tok-b",
+                    "result": {"ok": True, "actionType": "scroll"},
+                },
+            }
+        )
+        record = server._sessions["sid-a"]["browser_action_requests"]["req-a"]
+    finally:
+        server._sessions.pop("sid-a", None)
+        server._sessions.pop("sid-b", None)
+
+    assert no_session["error"]["message"] == "session_id is required"
+    assert cross_session["error"]["message"] == "browser action request not found"
+    assert wrong_token["error"]["message"] == "browser action request not found"
+    assert record["status"] == "requested"
+
+
+def test_browser_action_result_requires_originating_transport():
+    class _Transport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, obj):
+            self.frames.append(obj)
+            return True
+
+        def close(self):
+            return None
+
+    owner_transport = _Transport()
+    other_transport = _Transport()
+    server._sessions["sid"] = _session()
+    try:
+        requested = server.dispatch(
+            {
+                "id": "request",
+                "method": "browser.action.request",
+                "params": {"session_id": "sid", "action": {"type": "scroll"}},
+            },
+            owner_transport,
+        )
+        request_id = requested["result"]["request_id"]
+        record = server._sessions["sid"]["browser_action_requests"][request_id]
+        wrong_transport = server.dispatch(
+            {
+                "id": "wrong-transport",
+                "method": "browser.action.result",
+                "params": {
+                    "session_id": "sid",
+                    "request_id": request_id,
+                    "extension_context": record["extension_context"],
+                    "result_token": record["result_token"],
+                    "result": {"ok": True, "actionType": "scroll"},
+                },
+            },
+            other_transport,
+        )
+        accepted = server.dispatch(
+            {
+                "id": "accepted",
+                "method": "browser.action.result",
+                "params": {
+                    "session_id": "sid",
+                    "request_id": request_id,
+                    "extension_context": record["extension_context"],
+                    "result_token": record["result_token"],
+                    "result": {"ok": True, "actionType": "scroll"},
+                },
+            },
+            owner_transport,
+        )
+        session = server._sessions["sid"]
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert wrong_transport["error"]["message"] == "browser action request not found"
+    assert accepted["result"]["ok"] is True
+    assert session["browser_action_requests"][request_id]["status"] == "completed"
+
+
 def test_browser_action_tool_callback_requests_and_waits_for_sanitized_result(monkeypatch):
     events = []
     monkeypatch.setattr(
@@ -4924,14 +5100,18 @@ def test_browser_action_tool_callback_requests_and_waits_for_sanitized_result(mo
     def complete_result():
         deadline = time.time() + 1
         while time.time() < deadline:
-            if "req-tool" in server._sessions["sid"].get("browser_action_requests", {}):
+            requests = server._sessions["sid"].get("browser_action_requests", {})
+            if requests:
+                request_id, record = next(iter(requests.items()))
                 server.handle_request(
                     {
                         "id": "result",
                         "method": "browser.action.result",
                         "params": {
                             "session_id": "sid",
-                            "request_id": "req-tool",
+                            "request_id": request_id,
+                            "extension_context": record["extension_context"],
+                            "result_token": record["result_token"],
                             "result": {
                                 "ok": True,
                                 "actionType": "screenshot",
@@ -4957,11 +5137,12 @@ def test_browser_action_tool_callback_requests_and_waits_for_sanitized_result(mo
     finally:
         server._sessions.pop("sid", None)
 
+    request_id = next(iter(session["browser_action_requests"]))
     payload = json.loads(raw)
     assert payload == {
         "ok": True,
         "status": "completed",
-        "request_id": "req-tool",
+        "request_id": request_id,
         "result": {
             "ok": True,
             "actionType": "screenshot",
@@ -4969,8 +5150,10 @@ def test_browser_action_tool_callback_requests_and_waits_for_sanitized_result(mo
             "hasDataUrl": True,
         },
     }
+    assert request_id != "req-tool"
     assert "dataUrl" not in raw
-    assert session["browser_action_requests"]["req-tool"]["status"] == "completed"
+    assert session["browser_action_requests"][request_id]["status"] == "completed"
+    assert session["browser_action_requests"][request_id]["action"]["traceRequestId"] == "req-tool"
     assert events[0][0] == "browser.action.requested"
     assert events[-1][0] == "browser.action.result"
 
