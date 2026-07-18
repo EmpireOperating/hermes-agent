@@ -24,6 +24,87 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+_DEFAULT_GATEWAY_MAX_IN_PROGRESS = 2
+_DEFAULT_GATEWAY_MAX_IN_PROGRESS_PER_PROFILE = 1
+_DEFAULT_GATEWAY_MAX_SPAWN = 2
+
+
+def _coerce_positive_int_config(
+    kanban_cfg: dict,
+    key: str,
+    *,
+    label: str,
+) -> Optional[int]:
+    raw_value = kanban_cfg.get(key, None)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid %s=%r; ignoring", label, raw_value)
+        return None
+    if value < 1:
+        logger.warning("kanban dispatcher: %s=%r is below 1; ignoring", label, raw_value)
+        return None
+    return value
+
+
+def _resolve_dispatch_concurrency_caps(
+    kanban_cfg: dict,
+) -> "tuple[Optional[int], Optional[int], Optional[int]]":
+    """Return gateway dispatcher caps, defaulting to bounded fan-out.
+
+    Explicit ``kanban.max_spawn``, ``kanban.max_in_progress``, and
+    ``kanban.max_in_progress_per_profile`` remain authoritative. If none are
+    configured, the embedded gateway dispatcher uses conservative defaults so
+    one polluted/bulk-loaded board cannot spawn hundreds of full workers in a
+    single tick.
+    """
+    max_spawn = _coerce_positive_int_config(
+        kanban_cfg,
+        "max_spawn",
+        label="kanban.max_spawn",
+    )
+    max_in_progress = _coerce_positive_int_config(
+        kanban_cfg,
+        "max_in_progress",
+        label="kanban.max_in_progress",
+    )
+    max_in_progress_per_profile = _coerce_positive_int_config(
+        kanban_cfg,
+        "max_in_progress_per_profile",
+        label="kanban.max_in_progress_per_profile",
+    )
+
+    if (
+        max_spawn is None
+        and max_in_progress is None
+        and max_in_progress_per_profile is None
+    ):
+        max_spawn = _DEFAULT_GATEWAY_MAX_SPAWN
+        max_in_progress = _DEFAULT_GATEWAY_MAX_IN_PROGRESS
+        max_in_progress_per_profile = _DEFAULT_GATEWAY_MAX_IN_PROGRESS_PER_PROFILE
+        logger.warning(
+            "kanban dispatcher: no concurrency caps configured; using safe "
+            "gateway defaults max_spawn=%d max_in_progress=%d "
+            "max_in_progress_per_profile=%d",
+            max_spawn,
+            max_in_progress,
+            max_in_progress_per_profile,
+        )
+    else:
+        if max_spawn is not None:
+            logger.info("kanban dispatcher: max_spawn=%d", max_spawn)
+        if max_in_progress is not None:
+            logger.info("kanban dispatcher: max_in_progress=%d", max_in_progress)
+        if max_in_progress_per_profile is not None:
+            logger.info(
+                "kanban dispatcher: max_in_progress_per_profile=%d",
+                max_in_progress_per_profile,
+            )
+
+    return max_spawn, max_in_progress, max_in_progress_per_profile
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -962,35 +1043,14 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
-        if max_spawn is not None:
-            logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
-
-        # Cap the number of simultaneously running tasks so slow workers
-        # (local LLMs, resource-constrained hosts) don't pile up and time
-        # out. When set, the dispatcher skips spawning when the board
-        # already has this many tasks in 'running' status.
-        raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
-        max_in_progress = None
-        if raw_max_in_progress is not None:
-            try:
-                max_in_progress = int(raw_max_in_progress)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
-                    raw_max_in_progress,
-                )
-                max_in_progress = None
-            else:
-                if max_in_progress < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
-                        raw_max_in_progress,
-                    )
-                    max_in_progress = None
-                else:
-                    logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
+        # For the embedded gateway dispatcher, absence of every concurrency
+        # cap is unsafe: one polluted or bulk-loaded board can otherwise spawn
+        # hundreds of full Hermes worker processes in one tick. Keep explicit
+        # operator settings authoritative, but default the gateway path to a
+        # small cap so messaging stays alive under bad board state.
+        max_spawn, max_in_progress, max_in_progress_per_profile = (
+            _resolve_dispatch_concurrency_caps(kanban_cfg)
+        )
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
@@ -1035,35 +1095,6 @@ class GatewayKanbanWatchersMixin:
                 "will route to this profile)",
                 default_assignee,
             )
-
-        # Read kanban.max_in_progress_per_profile — per-profile concurrency
-        # cap (#21582). When set, no single profile gets more than N
-        # workers running at once, even if the global max_in_progress
-        # would allow it. Prevents one profile's local model / API quota
-        # / browser pool from being overwhelmed by a fan-out.
-        raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
-        max_in_progress_per_profile = None
-        if raw_per_profile is not None:
-            try:
-                max_in_progress_per_profile = int(raw_per_profile)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
-                    raw_per_profile,
-                )
-                max_in_progress_per_profile = None
-            else:
-                if max_in_progress_per_profile < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
-                        raw_per_profile,
-                    )
-                    max_in_progress_per_profile = None
-                else:
-                    logger.info(
-                        "kanban dispatcher: max_in_progress_per_profile=%d",
-                        max_in_progress_per_profile,
-                    )
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify

@@ -101,3 +101,53 @@ def test_reentrant_same_path_lock_is_exclusive(conn):
         assert held_a is True
         with kb._dispatch_tick_lock(db_path) as held_b:
             assert held_b is False, "same-board lock must be exclusive"
+
+
+def _review_task(conn, title: str, assignee: str) -> str:
+    task_id = kb.create_task(conn, title=title, assignee=assignee)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?",
+            (task_id,),
+        )
+    return task_id
+
+
+def test_review_dispatch_respects_max_in_progress_without_ready_rows(conn, monkeypatch):
+    """Review-only queues must obey the same global cap as ready queues.
+
+    The gateway can otherwise be configured with only kanban.max_in_progress
+    and still fan out an unbounded review column when no ready rows exist.
+    """
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    _review_task(conn, "review one", "reviewer")
+    _review_task(conn, "review two", "reviewer")
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace, board=None: 12345,
+        dry_run=True,
+        max_spawn=None,
+        max_in_progress=1,
+    )
+
+    assert len(result.spawned) == 1
+
+
+def test_review_dispatch_respects_per_profile_cap(conn, monkeypatch):
+    """Review dispatch must not bypass per-profile worker ceilings."""
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    first = _review_task(conn, "review one", "reviewer")
+    second = _review_task(conn, "review two", "reviewer")
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace, board=None: 12345,
+        dry_run=True,
+        max_spawn=2,
+        max_in_progress=2,
+        max_in_progress_per_profile=1,
+    )
+
+    assert result.spawned == [(first, "reviewer", "")]
+    assert result.skipped_per_profile_capped == [(second, "reviewer", 1)]

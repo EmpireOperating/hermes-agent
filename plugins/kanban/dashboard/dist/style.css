@@ -1616,6 +1616,7 @@
 }
 .hermes-mission-list__item.is-selected { border-color: var(--color-ring); background: color-mix(in srgb, var(--color-ring) 8%, var(--color-card)); }
 .hermes-mission-list__item span, .hermes-mission-list__item em { font-size: .68rem; color: var(--color-muted-foreground); }
+.hermes-mission-list__item .hermes-mission-elapsed, .hermes-mission-detail__heading .hermes-mission-elapsed { color: var(--color-foreground); font-weight: 600; }
 .hermes-mission-list__item em { color: var(--color-destructive); }
 .hermes-mission-detail { display: flex; flex-direction: column; gap: .7rem; min-width: 0; }
 .hermes-mission-detail--empty { align-items: center; justify-content: center; color: var(--color-muted-foreground); font-size: .8rem; }

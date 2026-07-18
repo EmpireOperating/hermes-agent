@@ -244,6 +244,30 @@
     return `${url}${sep}board=${encodeURIComponent(board)}`;
   }
 
+  function formatMissionElapsed(mission, nowSeconds) {
+    if (!mission || !mission.created_at) return "";
+    const start = Number(mission.created_at) || 0;
+    if (!start) return "";
+    const end = Number(mission.completed_at || 0) || Number(nowSeconds || 0) || Math.floor(Date.now() / 1000);
+    const secs = Math.max(0, end - start);
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    if (secs < 86400) {
+      const hours = Math.floor(secs / 3600);
+      const mins = Math.floor((secs % 3600) / 60);
+      return mins ? `${hours}h ${mins}m` : `${hours}h`;
+    }
+    const days = Math.floor(secs / 86400);
+    const hours = Math.floor((secs % 86400) / 3600);
+    return hours ? `${days}d ${hours}h` : `${days}d`;
+  }
+
+  function missionElapsedLabel(mission, nowSeconds) {
+    const elapsed = formatMissionElapsed(mission, nowSeconds);
+    if (!elapsed) return "";
+    return mission && mission.completed_at ? `Ran ${elapsed}` : `Running ${elapsed}`;
+  }
+
   // The SDK's Select component fires ``onValueChange(value)`` directly
   // (it's a shadcn-style popup, not a native <select>). Older plugin
   // code calls ``onChange({target: {value}})`` which silently never
@@ -305,6 +329,7 @@
     const [notice, setNotice] = useState("");
     const [steerTask, setSteerTask] = useState("");
     const [steerText, setSteerText] = useState("");
+    const [nowSeconds, setNowSeconds] = useState(function () { return Math.floor(Date.now() / 1000); });
     const submitRef = useRef(false);
     const statusRequestRef = useRef(0);
     const [draft, setDraft] = useState(function () { return {
@@ -365,6 +390,12 @@
       const timer = setInterval(function () { loadStatus(selectedId); }, 5000);
       return function () { clearInterval(timer); };
     }, [expanded, selectedId, loadStatus]);
+    useEffect(function () {
+      if (!expanded) return undefined;
+      setNowSeconds(Math.floor(Date.now() / 1000));
+      const timer = setInterval(function () { setNowSeconds(Math.floor(Date.now() / 1000)); }, 30000);
+      return function () { clearInterval(timer); };
+    }, [expanded]);
 
     const project = projects.find(function (item) { return item.id === draft.project_id; }) || null;
     function postMission(path, body, success) {
@@ -479,6 +510,7 @@
         h("div", { className: "hermes-mission-workspace" },
           h("aside", { className: "hermes-mission-list" }, missions.length ? missions.map(function (mission) {
             const counts = mission.task_counts || {};
+            const elapsedLabel = missionElapsedLabel(mission, nowSeconds);
             return h("button", { key: mission.id, type: "button",
               className: cn("hermes-mission-list__item", selectedId === mission.id && "is-selected"),
               onClick: function () {
@@ -487,11 +519,13 @@
                 setSelectedId(mission.id);
               } }, h("strong", null, mission.objective),
               h("span", null, `${mission.id} · ${mission.status} · ${counts.done || 0}/${counts.total || 0} done`),
+              elapsedLabel ? h("span", { className: "hermes-mission-elapsed", title: mission.created_at ? `Started ${mission.created_at}` : "" }, elapsedLabel) : null,
               counts.blocked ? h("em", null, `${counts.blocked} blocked`) : null);
           }) : h("p", null, "No missions on this board.")),
           status ? h("section", { className: "hermes-mission-detail" },
             h("div", { className: "hermes-mission-detail__heading" }, h("div", null,
-              h("h3", null, status.mission.objective), h("p", null, `${status.mission.project_id} · ${status.mission.repo_root}`)),
+              h("h3", null, status.mission.objective), h("p", null, `${status.mission.project_id} · ${status.mission.repo_root}`),
+              h("p", { className: "hermes-mission-elapsed" }, missionElapsedLabel(status.mission, nowSeconds))),
               h(Badge, { variant: status.mission.status === "completed" ? "default" : "outline" }, status.mission.status)),
             h("div", { className: "hermes-mission-receipt" },
               h("div", null, h("b", null, "Acceptance"), h("ul", null, status.mission.acceptance_criteria.map(function (x, i) { return h("li", { key: i }, x); }))),

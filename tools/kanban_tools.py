@@ -118,6 +118,28 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _completion_expected_run_id(task: Any, task_id: str) -> Optional[int]:
+    """Return the run id to require for this completion attempt.
+
+    Dispatcher-spawned workers normally carry ``HERMES_KANBAN_RUN_ID`` and
+    should only close the run they were claimed for. Some recovery/manual
+    worker sessions, however, are scoped to the correct ``HERMES_KANBAN_TASK``
+    but wake with no active ``tasks.current_run_id`` (the task is merely
+    ``ready``/``blocked``). ``kanban_db.complete_task`` deliberately supports
+    that manual-completion shape when ``expected_run_id`` is omitted; passing a
+    stale env run id turns a valid handoff into the confusing
+    "unknown id or already terminal" error. Keep strict run matching whenever
+    the DB says a run is active; fall back to the manual path only when the
+    task itself has no current run pointer.
+    """
+    run_id = _worker_run_id(task_id)
+    if run_id is None:
+        return None
+    if task is not None and getattr(task, "current_run_id", None) is None:
+        return None
+    return run_id
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -796,7 +818,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=_completion_expected_run_id(task, tid),
                     signoff_profile=(
                         task.assignee if has_supervisor_signoff else None
                     ),

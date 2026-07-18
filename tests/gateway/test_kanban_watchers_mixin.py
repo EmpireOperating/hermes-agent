@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import inspect
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _resolve_dispatch_concurrency_caps,
+)
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -67,3 +70,17 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+def test_dispatcher_uses_bounded_defaults_when_no_caps_configured():
+    assert _resolve_dispatch_concurrency_caps({}) == (2, 2, 1)
+
+
+def test_dispatcher_keeps_explicit_operator_caps():
+    assert _resolve_dispatch_concurrency_caps(
+        {
+            "max_spawn": "7",
+            "max_in_progress": "5",
+            "max_in_progress_per_profile": "3",
+        }
+    ) == (7, 5, 3)

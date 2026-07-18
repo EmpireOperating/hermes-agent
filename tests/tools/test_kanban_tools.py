@@ -590,6 +590,46 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
     assert ok.get("ok") is True
 
 
+def test_complete_ready_task_ignores_stale_env_run_id(monkeypatch, worker_env):
+    """A task-scoped worker may wake with no active DB run pointer.
+
+    Regression for live Orca scratch dogfood: the task was ``ready`` with
+    ``current_run_id`` NULL, but the worker process still carried a stale
+    ``HERMES_KANBAN_RUN_ID``. The tool passed that stale id as an expected run
+    and turned a valid manual/recovery completion into "unknown id or already
+    terminal". ``kanban_db.complete_task`` intentionally supports ready-task
+    completion when no expected run is supplied, so the tool should use that
+    path when the DB has no current run.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', current_run_id = NULL WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+
+    ok = json.loads(kt._handle_complete({"summary": "manual ready completion"}))
+    assert ok.get("ok") is True, ok
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "done"
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.summary == "manual ready completion"
+    finally:
+        conn.close()
+
+
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     """Goal-mode tasks must pass the auxiliary judge before completion.
     Regression for #38367: workers bypassing the judge via early kanban_complete."""
