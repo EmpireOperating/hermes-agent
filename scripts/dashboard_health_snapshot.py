@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,91 @@ def collect_service(name: str) -> dict[str, Any]:
         "n_restarts": _as_int(parsed.get("NRestarts")),
         "result": parsed.get("Result", ""),
         "error": proc.stderr.strip() if proc.returncode else "",
+    }
+
+
+def _proc_stat(pid: int) -> tuple[int, str] | None:
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except Exception:
+        return None
+    # comm is wrapped in parens and may contain spaces. The parent pid is the
+    # fourth field after the closing paren: "pid (comm) state ppid ...".
+    try:
+        after = text.rsplit(")", 1)[1].strip().split()
+        return int(after[1]), str(after[0])
+    except Exception:
+        return None
+
+
+def collect_descendants(root_pid: int) -> dict[str, Any]:
+    if root_pid <= 0:
+        return {"total_processes": 0, "total_threads": 0, "by_comm": {}, "by_state": {}, "top": []}
+    children: dict[int, list[int]] = {}
+    states: dict[int, str] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        parsed = _proc_stat(pid)
+        if parsed is None:
+            continue
+        ppid, state = parsed
+        children.setdefault(ppid, []).append(pid)
+        states[pid] = state
+
+    descendants: list[int] = []
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        descendants.append(pid)
+        stack.extend(children.get(pid, []))
+
+    by_comm: dict[str, dict[str, int]] = {}
+    by_state: dict[str, int] = {}
+    rows: list[dict[str, Any]] = []
+    now = time.time()
+    ticks = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK"))
+    boot_time = 0.0
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                boot_time = float(line.split()[1])
+                break
+    except Exception:
+        pass
+    for pid in descendants:
+        proc_dir = Path(f"/proc/{pid}")
+        try:
+            comm = (proc_dir / "comm").read_text().strip() or "unknown"
+        except Exception:
+            comm = "unknown"
+        state = states.get(pid, "?")
+        try:
+            status_lines = (proc_dir / "status").read_text().splitlines()
+            threads = next((int(line.split()[1]) for line in status_lines if line.startswith("Threads:")), 1)
+        except Exception:
+            threads = 1
+        etimes = 0
+        try:
+            parts = (proc_dir / "stat").read_text().rsplit(")", 1)[1].strip().split()
+            start_ticks = int(parts[19])
+            if boot_time:
+                etimes = max(0, int(now - (boot_time + start_ticks / ticks)))
+        except Exception:
+            pass
+        by_comm.setdefault(comm, {"processes": 0, "threads": 0})
+        by_comm[comm]["processes"] += 1
+        by_comm[comm]["threads"] += threads
+        by_state[state] = by_state.get(state, 0) + 1
+        rows.append({"pid": pid, "comm": comm, "state": state, "threads": threads, "etimes": etimes})
+    rows.sort(key=lambda row: int(row.get("threads") or 0), reverse=True)
+    return {
+        "total_processes": len(descendants),
+        "total_threads": sum(int(row.get("threads") or 0) for row in rows),
+        "by_comm": by_comm,
+        "by_state": by_state,
+        "top": rows[:12],
     }
 
 
@@ -194,6 +280,7 @@ def collect_snapshot() -> dict[str, Any]:
     }
     memory = collect_memory()
     pressure = collect_pressure()
+    dashboard_descendants = collect_descendants(int(services["dashboard"].get("pid") or 0))
     summary = summarize_pressure(
         dashboard_memory_bytes=int(services["dashboard"].get("memory_bytes") or 0),
         dashboard_tasks=int(services["dashboard"].get("tasks") or 0),
@@ -207,6 +294,7 @@ def collect_snapshot() -> dict[str, Any]:
         "pressure": pressure,
         "active_miniapp_jobs": collect_miniapp_jobs(),
         "active_kanban": collect_kanban_work(),
+        "dashboard_descendants": dashboard_descendants,
         "summary": summary,
     }
 
@@ -232,6 +320,13 @@ def print_human(snapshot: dict[str, Any]) -> None:
     print(f"PSI memory: some avg10={psi.get('some_avg10', 0.0):.2f} avg60={psi.get('some_avg60', 0.0):.2f}; full avg10={psi.get('full_avg10', 0.0):.2f} avg60={psi.get('full_avg60', 0.0):.2f}")
     print(f"Mini App jobs: {_counts_text(snapshot['active_miniapp_jobs'])}")
     print(f"Orca/Kanban: {_counts_text(snapshot['active_kanban'])}")
+    desc = snapshot.get("dashboard_descendants") or {}
+    by_comm = desc.get("by_comm") or {}
+    if by_comm:
+        parts = []
+        for name, counts in sorted(by_comm.items(), key=lambda item: int((item[1] or {}).get("threads") or 0), reverse=True)[:5]:
+            parts.append(f"{name}={counts.get('processes', 0)}p/{counts.get('threads', 0)}t")
+        print(f"Dashboard descendants: {desc.get('total_processes', 0)}p/{desc.get('total_threads', 0)}t; " + ", ".join(parts))
     print(f"Summary: dashboard_bloated={snapshot['summary']['dashboard_bloated']} needs_cleanup={snapshot['summary']['needs_cleanup']}")
 
 

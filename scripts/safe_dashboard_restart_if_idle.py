@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_kanban_idle_backlog=args.allow_kanban_idle_backlog,
     )
 
-    payload: dict[str, Any] = {"decision": asdict(decision), "applied": False}
+    payload: dict[str, Any] = {"decision": asdict(decision), "applied": False, "before": before}
     if not decision.restart:
         if args.json:
             print(json.dumps(payload, sort_keys=True))

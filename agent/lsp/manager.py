@@ -166,16 +166,19 @@ class LSPService:
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
 
-        self._loop = _BackgroundLoop()
-        if self._enabled:
-            self._loop.start()
-
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._state_lock = threading.Lock()
+
+        self._loop = _BackgroundLoop()
+        self._reaper_stop = threading.Event()
+        self._reaper_thread: Optional[threading.Thread] = None
+        if self._enabled:
+            self._loop.start()
+            self._start_idle_reaper()
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
@@ -241,6 +244,32 @@ class LSPService:
             disabled_servers=disabled,
             idle_timeout=max(0.0, idle_timeout),
         )
+
+    def _start_idle_reaper(self) -> None:
+        """Start a tiny daemon that reaps idle LSP clients without new edits.
+
+        Activity-triggered reaping is not enough for a dashboard process: after
+        the last edit in many worktrees, no later LSP request may arrive to close
+        old Pyright/TypeScript workers. This periodic sweep keeps the long-lived
+        dashboard from accumulating server processes while otherwise idle.
+        """
+        if self._idle_timeout <= 0 or self._reaper_thread is not None:
+            return
+
+        def _loop() -> None:
+            interval = max(30.0, min(60.0, self._idle_timeout / 2.0))
+            while not self._reaper_stop.wait(interval):
+                try:
+                    self._loop.run(self._reap_idle_clients_async(), timeout=30.0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("LSP idle reaper failed: %s", exc)
+
+        self._reaper_thread = threading.Thread(
+            target=_loop,
+            name="hermes-lsp-reaper",
+            daemon=True,
+        )
+        self._reaper_thread.start()
 
     # ------------------------------------------------------------------
     # public API
@@ -437,13 +466,16 @@ class LSPService:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
 
     def shutdown(self) -> None:
-        """Tear down all clients and stop the background loop."""
-        if not self._enabled:
-            return
-        try:
-            self._loop.run(self._shutdown_async(), timeout=10.0)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("LSP shutdown error: %s", e)
+        """Stop all managed LSP servers and the periodic idle reaper."""
+        self._reaper_stop.set()
+        if self._reaper_thread is not None:
+            self._reaper_thread.join(timeout=2.0)
+            self._reaper_thread = None
+        if self._enabled:
+            try:
+                self._loop.run(self._shutdown_async(), timeout=10.0)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("LSP shutdown error: %s", e)
         self._loop.stop()
         clear_cache()
 
