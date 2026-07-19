@@ -7,8 +7,10 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -155,6 +157,39 @@ def test_service_e2e_delta_filter_with_line_shift(mock_pyright):
         assert new_diags == []
     finally:
         svc.shutdown()
+
+
+def test_service_reaps_idle_clients():
+    class FakeClient:
+        def __init__(self):
+            self.shutdown_called = False
+
+        async def shutdown(self):
+            self.shutdown_called = True
+
+    old = FakeClient()
+    fresh = FakeClient()
+    svc = LSPService(
+        enabled=False,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="manual",
+        idle_timeout=10.0,
+    )
+    old_key = ("pyright", "/old")
+    fresh_key = ("pyright", "/fresh")
+    svc._clients[old_key] = cast(Any, old)
+    svc._clients[fresh_key] = cast(Any, fresh)
+    svc._last_used[old_key] = 100.0
+    svc._last_used[fresh_key] = 195.0
+
+    reaped = asyncio.run(svc._reap_idle_clients_async(now=200.0))
+
+    assert reaped == 1
+    assert old.shutdown_called is True
+    assert fresh.shutdown_called is False
+    assert old_key not in svc._clients
+    assert fresh_key in svc._clients
 
 
 def test_service_status_includes_clients(mock_pyright):

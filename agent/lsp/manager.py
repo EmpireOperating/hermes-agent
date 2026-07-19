@@ -204,6 +204,10 @@ class LSPService:
         enabled = bool(lsp_cfg.get("enabled", True))
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
+        try:
+            idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
+        except (TypeError, ValueError):
+            idle_timeout = DEFAULT_IDLE_TIMEOUT
         install_strategy = lsp_cfg.get("install_strategy", "auto")
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
@@ -235,6 +239,7 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=max(0.0, idle_timeout),
         )
 
     # ------------------------------------------------------------------
@@ -485,6 +490,7 @@ class LSPService:
         return list(client.diagnostics_for(file_path))
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+        await self._reap_idle_clients_async()
         srv = find_server_for_file(file_path)
         if srv is None:
             return None
@@ -566,6 +572,34 @@ class LSPService:
             with self._state_lock:
                 self._spawning.pop(key, None)
 
+    async def _reap_idle_clients_async(self, *, now: Optional[float] = None) -> int:
+        """Shutdown LSP clients that have been idle longer than the configured TTL.
+
+        LSP clients are keyed by (server_id, workspace_root), so dashboard-heavy
+        work across many worktrees can otherwise keep Pyright/TS server indexes
+        resident forever. Reaping only happens on subsequent LSP activity and
+        never touches a client currently spawning.
+        """
+        if self._idle_timeout <= 0:
+            return 0
+        cutoff = (time.time() if now is None else now) - self._idle_timeout
+        with self._state_lock:
+            victims = [
+                (key, client)
+                for key, client in self._clients.items()
+                if key not in self._spawning and self._last_used.get(key, 0.0) < cutoff
+            ]
+            for key, _client in victims:
+                self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+        if not victims:
+            return 0
+        await asyncio.gather(
+            *(client.shutdown() for _key, client in victims),
+            return_exceptions=True,
+        )
+        return len(victims)
+
     async def _shutdown_async(self) -> None:
         with self._state_lock:
             clients = list(self._clients.values())
@@ -598,6 +632,7 @@ class LSPService:
             "enabled": self._enabled,
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
+            "idle_timeout": self._idle_timeout,
             "install_strategy": self._install_strategy,
             "clients": clients,
             "broken": broken,

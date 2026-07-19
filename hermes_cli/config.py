@@ -3034,6 +3034,12 @@ DEFAULT_CONFIG = {
         "wait_mode": "document",
         "wait_timeout": 5.0,
 
+        # Reap idle per-(server, workspace) child processes. Dashboard-heavy
+        # sessions can touch many worktrees; without this, Pyright/TS servers
+        # keep project indexes resident until the whole dashboard exits.
+        # 0 disables. Default: 10 minutes.
+        "idle_timeout": 600.0,
+
         # How to handle missing server binaries.
         # ``"auto"`` — try to install via npm/go/pip into
         #              ``<HERMES_HOME>/lsp/bin/`` on first use.

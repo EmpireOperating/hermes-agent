@@ -479,6 +479,101 @@ def test_enforce_session_cap_disabled_is_noop(server, monkeypatch):
     assert evicted == []
 
 
+def test_session_info_omits_full_system_prompt(server, monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "main")
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_probe_credentials", lambda _agent: "")
+
+    agent = types.SimpleNamespace(
+        model="test/model",
+        provider="test",
+        reasoning_config={},
+        service_tier="",
+        tools=[],
+        session_id="sess-1",
+        _cached_system_prompt="large prompt body" * 100,
+    )
+
+    info = server._session_info(agent, {"session_key": "sess-1", "cwd": "/tmp"})
+
+    assert "system_prompt" not in info
+    assert info["system_prompt_chars"] == len(agent._cached_system_prompt)
+    assert len(info["system_prompt_sha256"]) == 64
+
+
+def test_dashboard_runtime_status_reports_counts_only(server, monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_live_sessions": 2})
+
+    def _ready() -> threading.Event:
+        ev = threading.Event()
+        ev.set()
+        return ev
+
+    detached = server._detached_ws_transport
+    live = object()
+    server._sessions.clear()
+    server._pending.clear()
+    server._active_child_runs.clear()
+    server._child_mirrors.clear()
+    server._sessions.update(
+        {
+            "detached": {"transport": detached, "last_active": 100.0, "agent_ready": _ready()},
+            "running": {
+                "transport": detached,
+                "last_active": 200.0,
+                "running": True,
+                "agent_ready": _ready(),
+            },
+            "live": {"transport": live, "last_active": 300.0, "agent_ready": _ready()},
+        }
+    )
+    server._pending["live"] = ("prompt", threading.Event())
+    server._active_child_runs["child-live"] = time.time()
+    server._active_child_runs["child-stale"] = time.time() - server._CHILD_RUN_STALE_S - 1
+    server._child_mirrors["child-live"] = {"seq": 1}
+
+    resp = server.handle_request({"id": "r1", "method": "dashboard.runtime_status"})
+
+    result = resp["result"]
+    assert result == {
+        "sessions_total": 3,
+        "sessions_running": 1,
+        "sessions_detached": 2,
+        "sessions_evictable": 1,
+        "sessions_pending": 1,
+        "sessions_building": 0,
+        "active_child_runs": 1,
+        "child_mirrors": 1,
+        "max_live_sessions": 2,
+    }
+    serialized = json.dumps(result)
+    assert "system_prompt" not in serialized
+    assert "messages" not in serialized
+
+
+def test_close_sessions_for_transport_schedules_cap_enforcement_for_detached(server, monkeypatch):
+    transport = object()
+    scheduled = []
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: scheduled.append(True))
+
+    server._sessions.clear()
+    server._sessions.update(
+        {
+            "keep_detached": {"transport": transport},
+            "other": {"transport": object()},
+        }
+    )
+
+    reaped, detached = server._close_sessions_for_transport(transport)
+
+    assert (reaped, detached) == (0, 1)
+    assert server._sessions["keep_detached"]["transport"] is server._detached_ws_transport
+    assert scheduled == [True]
+
+
 def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
     """A user message persisted with list-shaped multimodal content used to
     crash session resume with ``'list' object has no attribute 'strip'``."""

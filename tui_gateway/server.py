@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -735,6 +736,11 @@ def _close_sessions_for_transport(
                 _schedule_ws_orphan_reap(sid)
             except Exception:
                 pass
+    if detached:
+        try:
+            _schedule_session_cap_enforcement()
+        except Exception:
+            pass
     return reaped, detached
 
 
@@ -824,6 +830,52 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     if ready is not None and not ready.is_set() and not session.get("lazy"):
         return False
     return _transport_is_dead(session.get("transport"))
+
+
+def _dashboard_runtime_status_snapshot() -> dict:
+    """Return count-only dashboard/TUI gateway runtime state.
+
+    This deliberately avoids prompts, transcripts, system prompts, tool schemas,
+    environment variables, and other large/sensitive fields. It is safe to expose
+    to local dashboard health tooling and to log during memory investigations.
+    """
+    now = time.time()
+    with _sessions_lock:
+        sessions = list(_sessions.items())
+    with _child_mirrors_lock:
+        child_mirrors = len(_child_mirrors)
+    active_child_runs = sum(
+        1 for ts in list(_active_child_runs.values()) if (now - ts) < _CHILD_RUN_STALE_S
+    )
+    sessions_total = len(sessions)
+    sessions_running = 0
+    sessions_detached = 0
+    sessions_evictable = 0
+    sessions_pending = 0
+    sessions_building = 0
+    for sid, session in sessions:
+        if session.get("running"):
+            sessions_running += 1
+        if _session_pending_kind(sid):
+            sessions_pending += 1
+        ready = session.get("agent_ready")
+        if ready is not None and not ready.is_set() and not session.get("lazy"):
+            sessions_building += 1
+        if _transport_is_dead(session.get("transport")):
+            sessions_detached += 1
+        if _session_is_lru_evictable(sid, session):
+            sessions_evictable += 1
+    return {
+        "sessions_total": sessions_total,
+        "sessions_running": sessions_running,
+        "sessions_detached": sessions_detached,
+        "sessions_evictable": sessions_evictable,
+        "sessions_pending": sessions_pending,
+        "sessions_building": sessions_building,
+        "active_child_runs": active_child_runs,
+        "child_mirrors": child_mirrors,
+        "max_live_sessions": _max_live_sessions(),
+    }
 
 
 def _enforce_session_cap() -> None:
@@ -3507,7 +3559,19 @@ def _session_info(agent, session: dict | None = None) -> dict:
     except Exception:
         info["mcp_servers"] = []
     try:
-        info["system_prompt"] = getattr(agent, "_cached_system_prompt", "") or ""
+        system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+        # session.info is sent repeatedly over the dashboard websocket and can be
+        # mirrored into logs. Shipping the full assembled prompt there made the
+        # long-lived dashboard retain huge tool/skill/memory payloads per
+        # session. The canonical full prompt remains persisted in state.db via
+        # RunAgent/session storage; dashboard only needs count/hash metadata for
+        # diagnostics and change detection.
+        info["system_prompt_chars"] = len(system_prompt)
+        info["system_prompt_sha256"] = (
+            hashlib.sha256(system_prompt.encode("utf-8", errors="ignore")).hexdigest()
+            if system_prompt
+            else ""
+        )
     except Exception:
         pass
     try:
@@ -8201,6 +8265,11 @@ def _(rid, params: dict) -> dict:
     except Exception:
         pass
     return _ok(rid, {"status": "interrupted"})
+
+
+@method("dashboard.runtime_status")
+def _(rid, params: dict) -> dict:
+    return _ok(rid, _dashboard_runtime_status_snapshot())
 
 
 # ── Delegation: subagent tree observability + controls ───────────────
