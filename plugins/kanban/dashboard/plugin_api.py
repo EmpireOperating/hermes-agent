@@ -801,6 +801,52 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 
 # ---------------------------------------------------------------------------
+# POST /tasks/:id/dependencies/supersede
+# ---------------------------------------------------------------------------
+
+class SupersedeDependencyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    old_parent_id: str
+    replacement_parent_id: str
+    actor: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/dependencies/supersede")
+def supersede_dependency(
+    task_id: str,
+    payload: SupersedeDependencyBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        try:
+            ok = kanban_db.supersede_parent_edge(
+                conn,
+                child_id=task_id,
+                old_parent_id=payload.old_parent_id,
+                replacement_parent_id=payload.replacement_parent_id,
+                actor=payload.actor or "dashboard",
+                reason=payload.reason,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        updated = kanban_db.get_task(conn, task_id)
+        return {
+            "ok": ok,
+            "task": _task_dict(updated) if updated else None,
+            "links": _links_for(conn, task_id),
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # PATCH /tasks/:id  (status / assignee / priority / title / body)
 # ---------------------------------------------------------------------------
 

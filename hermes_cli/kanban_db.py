@@ -2955,6 +2955,116 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return removed
 
 
+def _dependency_superseded_event_exists(
+    conn: sqlite3.Connection,
+    *,
+    child_id: str,
+    old_parent_id: str,
+    replacement_parent_id: str,
+) -> bool:
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'dependency_superseded'",
+        (child_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except Exception:
+            continue
+        if (
+            payload.get("child") == child_id
+            and payload.get("old_parent") == old_parent_id
+            and payload.get("replacement_parent") == replacement_parent_id
+        ):
+            return True
+    return False
+
+
+def supersede_parent_edge(
+    conn: sqlite3.Connection,
+    *,
+    child_id: str,
+    old_parent_id: str,
+    replacement_parent_id: str,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Mark an obsolete parent edge as superseded by a replacement parent.
+
+    This is the explicit recovery primitive for mission/control-plane graphs
+    where a blocked QA/worker task has been replaced by another linked parent
+    that completed successfully. It deliberately does not teach
+    ``recompute_ready`` to ignore blocked parents globally: ordinary blocked
+    parents remain load-bearing until this audited supersession is written.
+
+    The operation is idempotent. A repeat call with the same child/old/replacement
+    tuple returns ``True`` without writing duplicate events once the original
+    supersession event exists and the old link has already been removed.
+    """
+    if old_parent_id == replacement_parent_id:
+        raise ValueError("old parent and replacement parent must be different")
+    payload = {
+        "child": child_id,
+        "old_parent": old_parent_id,
+        "replacement_parent": replacement_parent_id,
+        "actor": (actor or "operator"),
+        "reason": (reason or "").strip() or None,
+    }
+    removed = False
+    with write_txn(conn):
+        missing = _find_missing_parents(
+            conn, [child_id, old_parent_id, replacement_parent_id]
+        )
+        if missing:
+            raise ValueError(f"unknown task(s): {', '.join(missing)}")
+
+        replacement_edge = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (replacement_parent_id, child_id),
+        ).fetchone()
+        if replacement_edge is None:
+            raise ValueError(
+                f"replacement parent {replacement_parent_id} is not linked to child {child_id}"
+            )
+
+        replacement = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (replacement_parent_id,)
+        ).fetchone()
+        if replacement["status"] != "done":
+            raise ValueError(
+                f"replacement parent {replacement_parent_id} must be done before superseding {old_parent_id}"
+            )
+
+        old_edge = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (old_parent_id, child_id),
+        ).fetchone()
+        if old_edge is None:
+            if _dependency_superseded_event_exists(
+                conn,
+                child_id=child_id,
+                old_parent_id=old_parent_id,
+                replacement_parent_id=replacement_parent_id,
+            ):
+                return True
+            raise ValueError(
+                f"old parent {old_parent_id} is not linked to child {child_id}"
+            )
+
+        cur = conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (old_parent_id, child_id),
+        )
+        removed = cur.rowcount > 0
+        if removed:
+            _append_event(conn, child_id, "dependency_superseded", payload)
+            _append_event(conn, old_parent_id, "dependency_superseded", payload)
+    if removed:
+        recompute_ready(conn)
+    return removed
+
+
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",

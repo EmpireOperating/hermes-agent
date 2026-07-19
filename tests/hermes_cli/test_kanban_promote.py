@@ -159,6 +159,138 @@ def test_promote_blocked_task_works(conn):
     assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_supersede_parent_edge_promotes_child_after_replacement_passes(conn):
+    old_qa = kb.create_task(conn, title="obsolete qa", assignee="qa")
+    replacement_qa = kb.create_task(conn, title="replacement qa", assignee="qa")
+    root = kb.create_task(
+        conn,
+        title="legacy mission root",
+        assignee="orca",
+        parents=[old_qa, replacement_qa],
+    )
+
+    assert kb.block_task(conn, old_qa, reason="gave up")
+    assert kb.complete_task(
+        conn,
+        replacement_qa,
+        summary="QA PASS",
+        metadata={"judgment": "PASS"},
+    )
+
+    root_task = kb.get_task(conn, root)
+    old_qa_task = kb.get_task(conn, old_qa)
+    assert root_task is not None
+    assert old_qa_task is not None
+    assert root_task.status == "todo"
+    assert old_qa_task.status == "blocked"
+
+    assert kb.supersede_parent_edge(
+        conn,
+        child_id=root,
+        old_parent_id=old_qa,
+        replacement_parent_id=replacement_qa,
+        actor="orca",
+        reason="replacement QA passed",
+    ) is True
+
+    assert kb.parent_ids(conn, root) == [replacement_qa]
+    root_task = kb.get_task(conn, root)
+    old_qa_task = kb.get_task(conn, old_qa)
+    assert root_task is not None
+    assert old_qa_task is not None
+    assert root_task.status == "ready"
+    assert old_qa_task.status == "blocked"
+
+    child_events = [
+        e for e in kb.list_events(conn, root) if e.kind == "dependency_superseded"
+    ]
+    old_parent_events = [
+        e for e in kb.list_events(conn, old_qa) if e.kind == "dependency_superseded"
+    ]
+    assert len(child_events) == 1
+    assert len(old_parent_events) == 1
+    assert child_events[0].payload == {
+        "child": root,
+        "old_parent": old_qa,
+        "replacement_parent": replacement_qa,
+        "actor": "orca",
+        "reason": "replacement QA passed",
+    }
+
+
+def test_supersede_parent_edge_requires_done_replacement(conn):
+    old_parent = kb.create_task(conn, title="old", assignee="qa")
+    replacement = kb.create_task(conn, title="replacement", assignee="qa")
+    root = kb.create_task(
+        conn,
+        title="root",
+        assignee="orca",
+        parents=[old_parent, replacement],
+    )
+    assert kb.block_task(conn, old_parent, reason="gave up")
+
+    with pytest.raises(ValueError, match="replacement parent .* must be done"):
+        kb.supersede_parent_edge(
+            conn,
+            child_id=root,
+            old_parent_id=old_parent,
+            replacement_parent_id=replacement,
+            actor="orca",
+            reason="too early",
+        )
+
+    assert set(kb.parent_ids(conn, root)) == {old_parent, replacement}
+    root_task = kb.get_task(conn, root)
+    assert root_task is not None
+    assert root_task.status == "todo"
+
+
+def test_supersede_parent_edge_is_idempotent(conn):
+    old_parent = kb.create_task(conn, title="old", assignee="qa")
+    replacement = kb.create_task(conn, title="replacement", assignee="qa")
+    root = kb.create_task(
+        conn,
+        title="root",
+        assignee="orca",
+        parents=[old_parent, replacement],
+    )
+    assert kb.block_task(conn, old_parent, reason="gave up")
+    assert kb.complete_task(conn, replacement, summary="PASS")
+
+    for _ in range(2):
+        assert kb.supersede_parent_edge(
+            conn,
+            child_id=root,
+            old_parent_id=old_parent,
+            replacement_parent_id=replacement,
+            actor="orca",
+            reason="replacement passed",
+        ) is True
+
+    assert kb.parent_ids(conn, root) == [replacement]
+    assert len([
+        e for e in kb.list_events(conn, root) if e.kind == "dependency_superseded"
+    ]) == 1
+
+
+def test_non_superseded_blocked_parent_still_prevents_promotion(conn):
+    blocked_parent = kb.create_task(conn, title="blocked", assignee="qa")
+    done_parent = kb.create_task(conn, title="done", assignee="qa")
+    root = kb.create_task(
+        conn,
+        title="root",
+        assignee="orca",
+        parents=[blocked_parent, done_parent],
+    )
+    assert kb.block_task(conn, blocked_parent, reason="needs human")
+    assert kb.complete_task(conn, done_parent, summary="PASS")
+
+    assert kb.recompute_ready(conn) == 0
+    root_task = kb.get_task(conn, root)
+    assert root_task is not None
+    assert root_task.status == "todo"
+
+
 # ---------------------------------------------------------------------------
 # CLI `_cmd_promote` — bulk via `--ids` (the issue's anti-respawn use case:
 # promote all children of a closed parent in one command).

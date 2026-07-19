@@ -78,6 +78,70 @@ def _insert_run(conn, task_id, *, worker_pid=None, ended_at=None):
     return cur.lastrowid
 
 
+def test_dashboard_supersede_dependency_endpoint_unstrands_replaced_parent(client):
+    conn = kb.connect()
+    try:
+        old_qa = kb.create_task(conn, title="obsolete qa", assignee="qa")
+        replacement_qa = kb.create_task(conn, title="replacement qa", assignee="qa")
+        root = kb.create_task(
+            conn,
+            title="legacy root",
+            assignee="orca",
+            parents=[old_qa, replacement_qa],
+        )
+        assert kb.block_task(conn, old_qa, reason="gave up")
+        assert kb.complete_task(conn, replacement_qa, summary="QA PASS")
+        root_task = kb.get_task(conn, root)
+        assert root_task is not None
+        assert root_task.status == "todo"
+    finally:
+        conn.close()
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{root}/dependencies/supersede",
+        json={
+            "old_parent_id": old_qa,
+            "replacement_parent_id": replacement_qa,
+            "actor": "orca",
+            "reason": "replacement QA passed",
+        },
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["task"]["status"] == "ready"
+    assert body["links"]["parents"] == [replacement_qa]
+
+
+def test_dashboard_supersede_dependency_endpoint_reports_invalid_replacement(client):
+    conn = kb.connect()
+    try:
+        old_qa = kb.create_task(conn, title="obsolete qa", assignee="qa")
+        replacement_qa = kb.create_task(conn, title="replacement qa", assignee="qa")
+        root = kb.create_task(
+            conn,
+            title="legacy root",
+            assignee="orca",
+            parents=[old_qa, replacement_qa],
+        )
+        assert kb.block_task(conn, old_qa, reason="gave up")
+    finally:
+        conn.close()
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{root}/dependencies/supersede",
+        json={
+            "old_parent_id": old_qa,
+            "replacement_parent_id": replacement_qa,
+            "actor": "orca",
+        },
+    )
+
+    assert r.status_code == 409
+    assert "must be done" in r.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # GET /workers/active
 # ---------------------------------------------------------------------------
