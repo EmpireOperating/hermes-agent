@@ -496,6 +496,53 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_orca_qa_complete_requires_structured_judgment(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "orca-qa")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="qa gate", assignee="orca-qa")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    from tools import kanban_tools as kt
+    prose_only = json.loads(kt._handle_complete({"summary": "PASS: looks good"}))
+    assert "metadata.judgment" in prose_only.get("error", "")
+
+    empty_evidence = json.loads(kt._handle_complete({
+        "summary": "PASS",
+        "metadata": {"judgment": "PASS", "evidence": {}},
+    }))
+    assert "metadata.evidence" in empty_evidence.get("error", "")
+
+    ok = json.loads(kt._handle_complete({
+        "summary": "PASS with evidence",
+        "metadata": {"judgment": "pass", "evidence": {"tests": ["unit"]}},
+    }))
+    assert ok.get("ok") is True, ok
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.metadata is not None
+        assert run.metadata["judgment"] == "PASS"
+        assert run.metadata["evidence"] == {"tests": ["unit"]}
+    finally:
+        conn.close()
+
+
 def test_complete_phantom_card_message_advertises_retry(worker_env):
     """A phantom-card rejection must surface a tool_error that explicitly
     tells the worker the task is still in-flight and how to retry — the

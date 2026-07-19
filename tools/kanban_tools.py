@@ -349,6 +349,32 @@ def _supervisor_identity_error(task_id: str, expected_profile: Any) -> Optional[
     )
 
 
+def _qa_completion_metadata_error(task: Any, metadata: Optional[dict]) -> Optional[str]:
+    """Require machine-readable PASS/FAIL evidence from Orca QA workers."""
+    if _canonical_profile(getattr(task, "assignee", None)) != "orca-qa":
+        return None
+    if not isinstance(metadata, dict):
+        return tool_error(
+            "orca-qa completions require metadata={\"judgment\": "
+            "\"PASS\"|\"FAIL\", \"evidence\": {...}} so downstream "
+            "Orca signoff can verify QA without parsing prose."
+        )
+    judgment = str(metadata.get("judgment") or "").strip().upper()
+    if judgment not in {"PASS", "FAIL"}:
+        return tool_error(
+            "orca-qa completions require metadata.judgment to be exactly "
+            "PASS or FAIL. Do not put the verdict only in summary prose."
+        )
+    metadata["judgment"] = judgment
+    evidence = metadata.get("evidence")
+    if evidence in (None, "") or evidence == {} or evidence == []:
+        return tool_error(
+            "orca-qa completions require non-empty metadata.evidence "
+            "describing the commands, artifacts, or checks behind the verdict."
+        )
+    return None
+
+
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:
@@ -641,6 +667,11 @@ def _handle_complete(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
+
+            if task:
+                qa_metadata_err = _qa_completion_metadata_error(task, metadata)
+                if qa_metadata_err:
+                    return qa_metadata_err
 
             # Authenticate supervisor-only completion before invoking the goal
             # judge or making any state change. Profile ids are canonicalized
@@ -1423,6 +1454,9 @@ KANBAN_COMPLETE_SCHEMA = {
         "``kanban.supervisor_profile`` is configured, a terminal worker's "
         "first completion submits this handoff for supervisor review; only "
         "the supervisor's approval emits the final done notification."
+        " Tasks assigned to the canonical ``orca-qa`` profile must include "
+        "``metadata.judgment`` exactly ``PASS`` or ``FAIL`` plus non-empty "
+        "``metadata.evidence``; a prose-only QA verdict is rejected."
     ),
     "parameters": {
         "type": "object",
