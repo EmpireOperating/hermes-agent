@@ -9,6 +9,51 @@
   width: 100%;
 }
 
+.hermes-kanban-mobile-refresh {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .hermes-kanban-mobile-refresh {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.55rem 0.65rem;
+    border: 1px solid color-mix(in srgb, var(--color-ring) 35%, var(--color-border));
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--color-card) 94%, transparent);
+    box-shadow: 0 10px 26px color-mix(in srgb, var(--color-background) 70%, transparent);
+    backdrop-filter: blur(8px);
+  }
+
+  .hermes-kanban-mobile-refresh__copy {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.1rem;
+  }
+
+  .hermes-kanban-mobile-refresh__copy strong {
+    font-size: 0.78rem;
+    line-height: 1.1;
+    color: var(--color-foreground);
+  }
+
+  .hermes-kanban-mobile-refresh__copy span {
+    font-size: 0.68rem;
+    line-height: 1.2;
+    color: var(--color-muted-foreground);
+  }
+
+  .hermes-kanban-mobile-refresh > button {
+    flex: 0 0 auto;
+  }
+}
+
 /* ---- Code/pre reset (theme-immune default) --------------------------- *
  *
  * Themes (shipped AND user-installable) routinely paint every <code> and

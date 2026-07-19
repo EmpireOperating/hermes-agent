@@ -43,6 +43,26 @@ def _load_plugin_router():
     return mod.router
 
 
+def test_mobile_refresh_affordance_is_mobile_only():
+    """The shipped plugin assets expose a narrow-screen refresh control.
+
+    The board already has a desktop toolbar refresh button; this guards the
+    mobile affordance contract without requiring a browser runtime in the
+    backend plugin test suite.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    dashboard = repo_root / "plugins" / "kanban" / "dashboard" / "dist"
+    js = (dashboard / "index.js").read_text(encoding="utf-8")
+    css = (dashboard / "style.css").read_text(encoding="utf-8")
+
+    assert "function MobileRefreshAffordance" in js
+    assert "h(MobileRefreshAffordance, { onRefresh: loadBoard })" in js
+    assert "Refresh Kanban board" in js
+    assert ".hermes-kanban-mobile-refresh {\n  display: none;" in css
+    assert "@media (max-width: 640px)" in css
+    assert "display: flex;" in css
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""

@@ -794,6 +794,30 @@
     }
   }
 
+  function MobileRefreshAffordance(props) {
+    const { t } = useI18n();
+    const [busy, setBusy] = useState(false);
+    function refreshNow() {
+      if (busy) return;
+      setBusy(true);
+      Promise.resolve(props.onRefresh && props.onRefresh())
+        .finally(function () { setBusy(false); });
+    }
+    return h("div", { className: "hermes-kanban-mobile-refresh" },
+      h("div", { className: "hermes-kanban-mobile-refresh__copy" },
+        h("strong", null, tx(t, "mobileRefreshTitle", "Refresh board")),
+        h("span", null, tx(t, "mobileRefreshHint", "Pull the latest Mission Control tasks without restarting.")),
+      ),
+      h(Button, {
+        onClick: refreshNow,
+        size: "sm",
+        disabled: busy,
+        title: tx(t, "mobileRefreshTitleHint", "Reload the Kanban board from the database."),
+        "aria-label": tx(t, "mobileRefreshAria", "Refresh Kanban board"),
+      }, busy ? tx(t, "refreshing", "Refreshing…") : tx(t, "refresh", "↻ Refresh")),
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Root page
   // -------------------------------------------------------------------------
@@ -1345,6 +1369,7 @@
           boardData,
           onOpen: setSelectedTaskId,
         }),
+        h(MobileRefreshAffordance, { onRefresh: loadBoard }),
         h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
