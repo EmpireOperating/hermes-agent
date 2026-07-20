@@ -127,12 +127,27 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 async def test_session_crud_and_message_history(adapter, session_db):
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
-        create_resp = await cli.post("/api/sessions", json={"title": "Mobile chat", "model": "test-model"})
+        create_resp = await cli.post(
+            "/api/sessions",
+            json={
+                "title": "Mobile chat",
+                "model": "test-model",
+                "provider": "test-provider",
+                "source": "hermes_browser",
+                "model_options": {"reasoning_effort": "low"},
+            },
+        )
         assert create_resp.status == 201
         created = await create_resp.json()
         session_id = created["session"]["id"]
         assert created["object"] == "hermes.session"
         assert created["session"]["title"] == "Mobile chat"
+        assert created["session"]["source"] == "hermes_browser"
+        stored = session_db.get_session(session_id)
+        assert stored["source"] == "hermes_browser"
+        assert stored["model"] == "test-model"
+        assert stored["model_config"]["provider"] == "test-provider"
+        assert stored["model_config"]["model_options"] == {"reasoning_effort": "low"}
 
         session_db.append_message(session_id, "user", "hello from phone")
         session_db.append_message(session_id, "assistant", "hello from hermes")
@@ -157,16 +172,28 @@ async def test_session_crud_and_message_history(adapter, session_db):
         assert [m["role"] for m in messages["data"]] == ["user", "assistant"]
         assert messages["data"][0]["content"] == "hello from phone"
 
-        patch_resp = await cli.patch(f"/api/sessions/{session_id}", json={"title": "Renamed"})
+        patch_resp = await cli.patch(f"/api/sessions/{session_id}", json={"title": "Renamed", "source": "miniapp"})
         assert patch_resp.status == 200
         patched = await patch_resp.json()
         assert patched["session"]["title"] == "Renamed"
+        assert patched["session"]["source"] == "miniapp"
+        assert session_db.get_session(session_id)["source"] == "miniapp"
 
         delete_resp = await cli.delete(f"/api/sessions/{session_id}")
         assert delete_resp.status == 200
         deleted = await delete_resp.json()
         assert deleted == {"object": "hermes.session.deleted", "id": session_id, "deleted": True}
         assert session_db.get_session(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_create_rejects_unsafe_source(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions", json={"title": "Bad source", "source": "bad source\nheader"})
+        assert resp.status == 400
+        payload = await resp.json()
+        assert payload["error"]["code"] == "invalid_session_source"
 
 
 @pytest.mark.asyncio

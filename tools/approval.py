@@ -779,6 +779,31 @@ DANGEROUS_PATTERNS_COMPILED = [
     for pattern, description in DANGEROUS_PATTERNS
 ]
 
+# Smart approval is deliberately not the final authority for actions that can
+# interrupt live work, deploy/cut over infrastructure, mutate a database, or
+# rewrite a security/config boundary. These expressions are evaluated before
+# smart-mode auto-approval and also ignore session/permanent allowlists.
+_ALWAYS_MANUAL_APPROVAL_PATTERNS = [
+    re.compile(r'\b(?:systemctl|service|launchctl|docker)\b[^\n;|&]*(?:\bstart\b|\bstop\b|\brestart\b|\bkill\b|\breset-failed\b|\bdaemon-reload\b)', _RE_FLAGS),
+    re.compile(r'\bsystemd-run\b[^\n;|&]*(?:\bsystemctl\b|\bservice\b|\bstart\b|\bstop\b|\brestart\b)', _RE_FLAGS),
+    re.compile(r'\bhermes\b[^\n;|&]*\bgateway\b[^\n;|&]*(?:\bstart\b|\bstop\b|\brestart\b)', _RE_FLAGS),
+    re.compile(r'\b(?:kubectl\s+(?:apply|delete|rollout)|helm\s+(?:upgrade|rollback|uninstall)|terraform\s+(?:apply|destroy)|docker\s+(?:build|push))\b', _RE_FLAGS),
+    re.compile(r'\b(?:drop|truncate|delete\s+from|update\s+\S+\s+set|alter\s+table)\b', _RE_FLAGS),
+    re.compile(r'\bhermes\b[^\n;|&]*\bconfig\b[^\n;|&]*\b(?:set|unset|remove|delete|reset)\b', _RE_FLAGS),
+]
+
+
+def requires_manual_approval(command: str) -> bool:
+    """Return whether *command* must never be smart-auto-approved.
+
+    This is a narrow floor above normal smart approvals. It deliberately
+    protects service lifecycle and deployment/cutover actions after a live
+    restart incident; routine reads such as ``git status`` remain eligible for
+    automatic approval.
+    """
+    normalized = _normalize_command_for_detection(command)
+    return any(pattern.search(normalized) for pattern in _ALWAYS_MANUAL_APPROVAL_PATTERNS)
+
 
 def _legacy_pattern_key(pattern: str) -> str:
     """Reproduce the old regex-derived approval key for backwards compatibility."""
@@ -2508,18 +2533,36 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # Service lifecycle, deploy/cutover, destructive database, and security/config
+    # actions are an explicit user-consent floor. They remain manual even for a
+    # YOLO session or approvals.mode=off, and never inherit prior allowlists.
+    must_prompt_manually = requires_manual_approval(command)
+
+    # --yolo or approvals.mode=off bypass normal approval prompts only.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not must_prompt_manually and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not must_prompt_manually and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+
+    # Mandatory-manual actions must never fall through to a non-interactive
+    # auto-allow path (including cron). There is no user present to consent.
+    if must_prompt_manually and not is_cli and not is_gateway and not is_ask:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: This service lifecycle, deploy/cutover, destructive database, "
+                "or security/config action requires interactive manual user approval."
+            ),
+        }
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -2633,8 +2676,12 @@ def check_all_command_guards(command: str, env_type: str,
             }
         # else: tirith_fail_open is True — allow as before (tirith_result stays "allow")
 
-    # Dangerous command check (detection only, no approval)
+    # Dangerous command check (detection only, no approval).
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if must_prompt_manually and not is_dangerous:
+        is_dangerous = True
+        pattern_key = "mandatory-manual-approval"
+        description = "always-manual action (service lifecycle, deploy/cutover, destructive database, or security/config mutation)"
 
     # --- Phase 2: Decide ---
 
@@ -2656,7 +2703,7 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((tirith_key, tirith_desc, True))
 
     if is_dangerous:
-        if not is_approved(session_key, pattern_key):
+        if must_prompt_manually or not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
     # Nothing to warn about
@@ -2667,7 +2714,7 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not must_prompt_manually:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
@@ -2724,9 +2771,9 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": redact_sensitive_text(combined_desc),
-                # Mirror the CLI's allow_permanent gate: a tirith warning downgrades
-                # "always" to session scope below, so the UI must not offer it.
-                "allow_permanent": not has_tirith,
+                # Mandatory-manual actions and Tirith findings never offer a
+                # session-wide/permanent bypass in the UI.
+                "allow_permanent": not has_tirith and not must_prompt_manually,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -2811,7 +2858,7 @@ def check_all_command_guards(command: str, env_type: str,
             pattern_key=primary_key,
             pattern_keys=all_keys,
             description=_disp_combined_desc,
-            allow_permanent=not has_tirith,
+            allow_permanent=not has_tirith and not must_prompt_manually,
         )
         if miniapp_choice in {"once", "session", "always"}:
             for key, _, is_tirith in warnings:
@@ -2867,7 +2914,7 @@ def check_all_command_guards(command: str, env_type: str,
         surface="cli",
     )
     choice = prompt_dangerous_approval(command, combined_desc,
-                                       allow_permanent=not has_tirith,
+                                       allow_permanent=not has_tirith and not must_prompt_manually,
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -2910,6 +2957,28 @@ def check_all_command_guards(command: str, env_type: str,
 
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
+
+
+_EXECUTE_CODE_DIRECT_SIDE_EFFECTS = re.compile(
+    r"\b(?:requests|httpx|urllib|socket|subprocess|ctypes|os\s*\.\s*system|"
+    r"os\s*\.\s*popen|popen|system|open|pathlib|shutil|sqlite3|"
+    r"google\s*\.oauth|credentials|write_file|patch)\b",
+    _RE_FLAGS,
+)
+
+
+def is_low_risk_execute_code_script(code: str) -> bool:
+    """Return True for terminal-only helper scripts whose child commands stay guarded.
+
+    Direct networking, credential access, filesystem/database APIs, or process
+    spawning remains subject to whole-script smart review.  The terminal tool
+    retains its normal per-command approval checks, so this removes only the
+    redundant outer card for ordinary diagnostic/helper wrappers.
+    """
+    normalized = str(code or "")
+    if "from hermes_tools import" not in normalized or "terminal(" not in normalized:
+        return False
+    return not bool(_EXECUTE_CODE_DIRECT_SIDE_EFFECTS.search(normalized))
 
 
 def check_execute_code_guard(code: str, env_type: str,
@@ -3004,6 +3073,12 @@ def check_execute_code_guard(code: str, env_type: str,
     # consulted, so every execute_code call re-prompts the user (#39275).
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    # In smart mode terminal-only wrappers defer to the individual terminal()
+    # guards.  Direct side-effect APIs stay behind the whole-script reviewer.
+    if approval_mode == "smart" and is_low_risk_execute_code_script(code):
+        return {"approved": True, "message": None,
+                "smart_approved": True, "description": "terminal-only execute_code wrapper"}
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()

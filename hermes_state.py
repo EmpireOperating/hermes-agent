@@ -2754,6 +2754,26 @@ class SessionDB:
             row = cursor.fetchone()
         return row["title"] if row else None
 
+    def update_session_source(self, session_id: str, source: str) -> bool:
+        """Update the product/source label for a session row.
+
+        Client surfaces that create sessions through the API server use this to
+        keep Browser/Desktop/Mini App grouping accurate in the shared state.db.
+        Validation of the source token lives at the API boundary.
+        """
+        if not session_id or not source:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET source = ? WHERE id = ?",
+                (source, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
 

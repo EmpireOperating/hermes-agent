@@ -95,6 +95,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_SESSION_SOURCE_LENGTH = 64
+SESSION_SOURCE_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -132,6 +134,22 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _normalize_session_source(value: Any, *, default: str = "api_server") -> Optional[str]:
+    """Return a safe source label for client-created session rows.
+
+    Browser, Desktop, and Mini App surfaces all read the same ``state.db``.
+    When an external client creates a session through the API server, preserve
+    the owning surface's source label so the shared session list can group it
+    correctly instead of flattening every browser-created chat to ``api_server``.
+    """
+    source = str(value or default).strip()
+    if not source or len(source) > MAX_SESSION_SOURCE_LENGTH:
+        return None
+    if not SESSION_SOURCE_RE.fullmatch(source):
+        return None
+    return source
 
 
 def _normalize_chat_content(
@@ -1742,11 +1760,25 @@ class APIServerAdapter(BasePlatformAdapter):
         if db.get_session(session_id):
             return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
 
+        source = _normalize_session_source(body.get("source"))
+        if source is None:
+            return web.json_response(_openai_error("Invalid session source", code="invalid_session_source"), status=400)
         model = body.get("model") or self._model_name
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
-        db.create_session(session_id, "api_server", model=str(model) if model else None, system_prompt=system_prompt)
+        model_config: Dict[str, Any] = {}
+        if isinstance(body.get("provider"), str) and body.get("provider").strip():
+            model_config["provider"] = body.get("provider").strip()
+        if isinstance(body.get("model_options"), dict):
+            model_config["model_options"] = body.get("model_options")
+        db.create_session(
+            session_id,
+            source,
+            model=str(model) if model else None,
+            model_config=model_config or None,
+            system_prompt=system_prompt,
+        )
         title = body.get("title")
         if title is not None:
             try:
@@ -1779,12 +1811,17 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        allowed = {"title", "end_reason"}
+        allowed = {"title", "end_reason", "source"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
 
         db = self._ensure_session_db()
+        if "source" in body:
+            source = _normalize_session_source(body.get("source"), default="")
+            if source is None:
+                return web.json_response(_openai_error("Invalid session source", code="invalid_session_source"), status=400)
+            db.update_session_source(session_id, source)
         if "title" in body:
             try:
                 db.set_session_title(session_id, "" if body["title"] is None else str(body["title"]))

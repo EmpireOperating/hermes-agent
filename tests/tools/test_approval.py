@@ -21,6 +21,7 @@ from tools.approval import (
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    requires_manual_approval,
 )
 
 
@@ -68,6 +69,44 @@ class TestSmartApproval:
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
         assert mock_call.call_args.kwargs["max_tokens"] == 16
+
+
+class TestMandatoryManualApproval:
+    def test_service_lifecycle_requires_manual_approval(self):
+        assert requires_manual_approval("systemctl --user restart hermes-miniapp-v4.service") is True
+        assert requires_manual_approval("systemd-run --user systemctl --user restart hermes-gateway.service") is True
+
+    def test_deployment_and_destructive_database_actions_require_manual_approval(self):
+        assert requires_manual_approval("kubectl rollout restart deployment/web") is True
+        assert requires_manual_approval("DROP TABLE members") is True
+        assert requires_manual_approval("hermes config set model.default gpt-5.6-terra") is True
+
+    def test_read_only_git_command_does_not_require_manual_approval(self):
+        assert requires_manual_approval("git status --short") is False
+
+    def test_smart_mode_never_auto_approves_service_restart(self, monkeypatch):
+        from tools import approval as mod
+
+        prompted = []
+        monkeypatch.setattr(mod, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(mod, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(mod, "is_current_session_yolo_enabled", lambda: False)
+        monkeypatch.setattr(
+            mod,
+            "_smart_approve",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("smart evaluator must not run")),
+        )
+        monkeypatch.setattr(
+            mod,
+            "prompt_dangerous_approval",
+            lambda *_args, **kwargs: (prompted.append(kwargs), "once")[1],
+        )
+
+        result = mod.check_all_command_guards("systemctl --user restart hermes-miniapp-v4.service", "local")
+
+        assert result["approved"] is True
+        assert prompted == [{"allow_permanent": False, "approval_callback": None}]
 
 
 class TestDetectDangerousRm:
@@ -2469,3 +2508,14 @@ class TestApprovalPromptRedaction:
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+
+class TestSmartExecuteCodeFastPath:
+    def test_terminal_only_script_defers_to_its_individual_command_guards(self):
+        from tools.approval import is_low_risk_execute_code_script
+        assert is_low_risk_execute_code_script("from hermes_tools import terminal\nprint(terminal('git status --short'))\n")
+
+    def test_direct_network_or_credential_script_still_requires_whole_script_review(self):
+        from tools.approval import is_low_risk_execute_code_script
+        assert not is_low_risk_execute_code_script("import requests\nrequests.post('https://example.invalid')\n")
+        assert not is_low_risk_execute_code_script("from google.oauth2.credentials import Credentials\nprint(Credentials)\n")
