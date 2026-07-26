@@ -1,6 +1,13 @@
 import './styles.css'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
+// Dev-only render/state churn counters. MUST precede the `react-dom` import
+// below: react-dom captures the devtools hook at module init, so bippy has to
+// install during THIS import's evaluation or every commit goes unseen
+// (verified — a late install reports renderers=0, commits=0). `vite.config.ts`
+// aliases this specifier to a no-op module for non-dev builds, so neither the
+// counters nor bippy reach a shipped renderer.
+import '@/debug/dev-only'
 
 import { QueryClientProvider } from '@tanstack/react-query'
 import { StrictMode } from 'react'
@@ -17,7 +24,11 @@ import { ThemeProvider } from './themes/context'
 
 installClipboardShim()
 
-if (import.meta.env.MODE !== 'production') {
+// The perf probe ships in dev, and in a production build ONLY when explicitly
+// opted in (VITE_PERF_PROBE=1) — this lets the perf harness measure a real,
+// minified production renderer for representative absolute numbers. Normal
+// `npm run build` leaves the flag unset, so the probe never reaches users.
+if (import.meta.env.MODE !== 'production' || import.meta.env.VITE_PERF_PROBE === '1') {
   import('./app/chat/perf-probe')
 }
 

@@ -385,6 +385,8 @@ class TestMiniAppExternalApprovalBridge:
             def __enter__(self):
                 data = json.loads(request_path.read_text(encoding="utf-8"))
                 assert data["status"] == "pending"
+                assert data["allow_permanent"] is True
+                assert data["allow_session"] is True
                 data["choice"] = "session"
                 data["status"] = "resolved"
                 request_path.write_text(json.dumps(data), encoding="utf-8")
@@ -411,6 +413,39 @@ class TestMiniAppExternalApprovalBridge:
 
         assert choice == "session"
         assert not request_path.exists()
+
+    def test_fallback_bridge_uses_current_scope_policy(self, monkeypatch):
+        session_key = "miniapp-user-scope-policy"
+        captured = {}
+
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual"},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        def fake_publish(**kwargs):
+            captured.update(kwargs)
+            return "deny"
+
+        monkeypatch.setattr(approval_module, "_publish_miniapp_external_approval", fake_publish)
+        approval_module.clear_session(session_key)
+        approval_module._permanent_approved.clear()
+
+        result = approval_module.check_all_command_guards("rm -rf /tmp/demo", "local")
+
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+        assert captured["allow_permanent"] is True
+        assert captured["allow_session"] is True
 
 
 class TestRmFalsePositiveFix:
