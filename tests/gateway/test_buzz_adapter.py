@@ -7,6 +7,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+from gateway.platforms.base import ProcessingOutcome
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
 # (plugin_adapter_buzz) so it cannot collide with other plugin adapters
@@ -364,7 +365,7 @@ class TestDmClassification:
         """Fallback discovery: with `dms list` broken (returns []), a
         DM-shaped `channels list` entry gets watched; real channels not
         already watched are left alone."""
-        a = _make_adapter()
+        a = _make_adapter({"channels": [CHANNEL]})
         cli = _ScriptedCli()
         cli.script("dms", "list", [])
         cli.script("channels", "list", [
@@ -379,6 +380,112 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
         assert CHANNEL not in a._channel_state
         assert a._may_reclassify_as_dm(CHANNEL) is False
+
+
+class TestAllJoinedChannelDiscovery:
+
+    @pytest.mark.asyncio
+    async def test_all_joined_mode_discovers_new_normal_channel(self):
+        a = _make_adapter()  # Empty channels means watch every joined channel.
+        cli = _ScriptedCli()
+        cli.script("dms", "list", [])
+        cli.script("channels", "list", [
+            {"channel_id": CHANNEL, "name": "general",
+             "description": "General conversation and community updates."},
+        ])
+        a._run_cli = cli
+
+        await a._discover_dms(seed=False)
+
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_explicit_allowlist_does_not_discover_new_normal_channel(self):
+        a = _make_adapter({"channels": [CHANNEL]})
+        unlisted = "11111111-2222-3333-4444-555555555555"
+        cli = _ScriptedCli()
+        cli.script("dms", "list", [])
+        cli.script("channels", "list", [
+            {"channel_id": unlisted, "name": "unlisted", "description": "Not allowed"},
+        ])
+        a._run_cli = cli
+
+        await a._discover_dms(seed=False)
+
+        assert unlisted not in a._channel_state
+
+
+class TestProcessingReactionLifecycle:
+
+    @staticmethod
+    def _processing_event():
+        event = MagicMock()
+        event.message_id = "a" * 64
+        event.source.chat_id = CHANNEL
+        return event
+
+    @pytest.mark.asyncio
+    async def test_processing_start_adds_eyes(self):
+        a = _make_adapter()
+        a.send_reaction = AsyncMock(return_value=True)
+        event = self._processing_event()
+
+        await a.on_processing_start(event)
+
+        a.send_reaction.assert_awaited_once_with(CHANNEL, event.message_id, "👀")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "terminal_emoji"),
+        [
+            (ProcessingOutcome.SUCCESS, "✅"),
+            (ProcessingOutcome.FAILURE, "❌"),
+            (ProcessingOutcome.CANCELLED, "🛑"),
+        ],
+    )
+    async def test_processing_complete_replaces_eyes_with_terminal_reaction(
+        self, outcome, terminal_emoji
+    ):
+        a = _make_adapter()
+        a.remove_reaction = AsyncMock(return_value=True)
+        a.send_reaction = AsyncMock(return_value=True)
+        event = self._processing_event()
+
+        await a.on_processing_complete(event, outcome)
+
+        a.remove_reaction.assert_awaited_once_with(CHANNEL, event.message_id, "👀")
+        a.send_reaction.assert_awaited_once_with(CHANNEL, event.message_id, terminal_emoji)
+
+    @pytest.mark.asyncio
+    async def test_terminal_reaction_survives_eyes_removal_failure(self):
+        a = _make_adapter()
+        a.remove_reaction = AsyncMock(return_value=False)
+        a.send_reaction = AsyncMock(return_value=True)
+        event = self._processing_event()
+
+        await a.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        a.send_reaction.assert_awaited_once_with(CHANNEL, event.message_id, "✅")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_does_not_add_post_dispatch_eyes(self):
+        a = _make_adapter()
+        a._message_handler = AsyncMock()
+        a.handle_message = AsyncMock()
+        a.send_reaction = AsyncMock(return_value=True)
+
+        await a._dispatch_message(
+            text="hello",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="b" * 64,
+            created_at=1000,
+        )
+
+        a.handle_message.assert_awaited_once()
+        a.send_reaction.assert_not_awaited()
 
 
 # ── Sending ───────────────────────────────────────────────────────────────

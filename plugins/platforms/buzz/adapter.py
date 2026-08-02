@@ -56,6 +56,7 @@ from gateway.platforms.base import (
     SendResult,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
 )
 from gateway.config import Platform
 
@@ -640,6 +641,55 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         return True
 
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Remove one of this identity's reactions via buzz-cli."""
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        args = [
+            "reactions", "remove",
+            "--event", str(message_id),
+            "--emoji", emoji,
+        ]
+        code, _out, err = await self._run_cli(args)
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Add an in-progress reaction when processing begins."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if chat_id and message_id:
+            await self.send_reaction(chat_id, message_id, "👀")
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """Replace the in-progress reaction with the terminal outcome."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not (chat_id and message_id):
+            return
+        try:
+            await self.remove_reaction(chat_id, message_id, "👀")
+        except Exception:
+            # Cosmetic cleanup must never suppress the terminal reaction.
+            logger.debug(
+                "Buzz: processing reaction removal failed for message %s",
+                message_id[:12],
+                exc_info=True,
+            )
+        terminal_emoji = {
+            ProcessingOutcome.SUCCESS: "✅",
+            ProcessingOutcome.FAILURE: "❌",
+            ProcessingOutcome.CANCELLED: "🛑",
+        }[outcome]
+        await self.send_reaction(chat_id, message_id, terminal_emoji)
+
     async def send_image(
         self,
         chat_id: str,
@@ -955,7 +1005,13 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
+            if ch_id in self._channel_state:
+                continue
+            # An empty configured channel list is the documented all-joined
+            # mode, so membership refreshes must add every newly joined normal
+            # channel as well as DM-shaped conversations.  A non-empty list is
+            # an explicit allowlist and remains closed to new normal channels.
+            if self.channels and not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")
@@ -1217,13 +1273,6 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(event)
-
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
 
 # ---------------------------------------------------------------------------

@@ -117,3 +117,39 @@ async def test_websocket_auth_raises_on_rejection():
 
     with pytest.raises(ConnectionError):
         await adapter._authenticate_websocket(RejectingWs())
+
+
+@pytest.mark.asyncio
+async def test_membership_event_subscribes_new_group_in_all_joined_mode(monkeypatch):
+    monkeypatch.delenv("BUZZ_CHANNELS", raising=False)
+    adapter = _make_adapter()  # Empty channels means all joined channels.
+    existing = CHANNEL
+    newly_joined = "11111111-2222-3333-4444-555555555555"
+    adapter._channel_state[existing] = {"chat_type": "group", "last_ts": 100, "seen": {}}
+
+    async def run_cli(args, *, input_text=None):
+        if args[:2] == ["dms", "list"]:
+            return 0, "[]", ""
+        if args[:2] == ["channels", "list"]:
+            return 0, json.dumps([
+                {"channel_id": existing, "name": "general", "description": "General"},
+                {"channel_id": newly_joined, "name": "test", "description": "Test"},
+            ]), ""
+        raise AssertionError(f"unexpected Buzz CLI call: {args}")
+
+    adapter._run_cli = run_cli
+    websocket = _FakeWebSocket()
+    subscriptions = {"existing": existing}
+
+    await adapter._handle_membership_event(
+        websocket,
+        subscriptions,
+        {"created_at": int(time.time()), "kind": 44100},
+    )
+
+    assert adapter._channel_state[newly_joined]["chat_type"] == "group"
+    assert newly_joined in subscriptions.values()
+    assert any(
+        message[0] == "REQ" and message[2].get("#h") == [newly_joined]
+        for message in websocket.sent
+    )
