@@ -2942,6 +2942,133 @@ class TestCuaToolCoverageExpansion:
         name, args = backend._session.call_tool.call_args.args
         assert args["window_id"] == 7
 
+    def test_focus_app_with_raise_window_activates_the_selected_window(self):
+        """The public raise_window contract must invoke cua-driver activation.
+
+        Selecting a background app alone is insufficient for the documented
+        foreground keyboard fallback: the selected PID/window must be passed
+        to cua-driver's bring_to_front operation.
+        """
+        backend = self._backend()
+        backend._session.call_tool.side_effect = [
+            {
+                "data": "", "images": [], "image_mime_types": [],
+                "structuredContent": {"windows": [{
+                    "app_name": "Chromium", "pid": 1859054,
+                    "window_id": 77, "is_on_screen": True,
+                    "z_index": 0, "title": "Apps Script",
+                }]},
+                "isError": False,
+            },
+            {
+                "data": "", "images": [], "image_mime_types": [],
+                "structuredContent": None, "isError": False,
+            },
+        ]
+
+        result = backend.focus_app("Chromium", raise_window=True)
+
+        assert result.ok is True
+        assert result.action == "focus_app"
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "list_windows", "bring_to_front",
+        ]
+        _, bring_args = backend._session.call_tool.call_args_list[1].args
+        assert bring_args["pid"] == 1859054
+        assert bring_args["window_id"] == 77
+
+    def test_hotkey_after_raising_window_uses_foreground_delivery(self):
+        """The explicit raise escape hatch must carry through to keyboard input."""
+        backend = self._backend()
+        backend._session.call_tool.side_effect = [
+            {
+                "data": "", "images": [], "image_mime_types": [],
+                "structuredContent": {"windows": [{
+                    "app_name": "Chromium", "pid": 1859054,
+                    "window_id": 77, "is_on_screen": True,
+                    "z_index": 0, "title": "Apps Script",
+                }]},
+                "isError": False,
+            },
+            {
+                "data": "", "images": [], "image_mime_types": [],
+                "structuredContent": None, "isError": False,
+            },
+            {
+                "data": "", "images": [], "image_mime_types": [],
+                "structuredContent": None, "isError": False,
+            },
+        ]
+
+        assert backend.focus_app("Chromium", raise_window=True).ok is True
+        assert backend.key("ctrl+l").ok is True
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "hotkey"
+        assert args["delivery_mode"] == "foreground"
+
+    def test_type_text_targets_captured_window(self):
+        backend = self._backend()
+        backend._active_pid = 1859054
+        backend._active_window_id = 77
+
+        backend.type_text("https://script.google.com/")
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "type_text"
+        assert args["pid"] == 1859054
+        assert args["window_id"] == 77
+
+    def test_hotkey_targets_captured_window(self):
+        backend = self._backend()
+        backend._active_pid = 1859054
+        backend._active_window_id = 77
+
+        backend.key("ctrl+l")
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "hotkey"
+        assert args["pid"] == 1859054
+        assert args["window_id"] == 77
+
+    def test_foreground_libei_failure_falls_back_to_wtype_for_text(self):
+        """An explicitly raised Hyprland target may use the foreground-only fallback."""
+        from unittest.mock import patch
+        from tools.computer_use.backend import ActionResult
+
+        backend = self._backend()
+        backend._active_pid = 1859054
+        backend._active_window_id = 77
+        backend._foreground_input_target = (1859054, 77)
+        with patch("tools.computer_use.cua_backend.sys.platform", "linux"), \
+             patch("tools.computer_use.cua_backend.shutil.which", return_value="/usr/bin/wtype"), \
+             patch("tools.computer_use.cua_backend.subprocess.run") as run, \
+             patch.object(backend, "_action", return_value=ActionResult(
+                 ok=False, action="type_text", message="libei input backend did not become ready",
+             )):
+            run.return_value.returncode = 0
+            result = backend.type_text("https://example.test/")
+
+        assert result.ok is True
+        assert result.meta == {"fallback": "wtype"}
+        assert run.call_args.args[0] == ["/usr/bin/wtype", "https://example.test/"]
+
+    def test_wtype_fallback_never_types_into_background_window(self):
+        from unittest.mock import patch
+        from tools.computer_use.backend import ActionResult
+
+        backend = self._backend()
+        backend._active_pid = 1859054
+        backend._active_window_id = 77
+        with patch("tools.computer_use.cua_backend.shutil.which") as which, \
+             patch.object(backend, "_action", return_value=ActionResult(
+                 ok=False, action="type_text", message="libei worker disconnected channel",
+             )):
+            result = backend.type_text("must-not-type")
+
+        assert result.ok is False
+        which.assert_not_called()
+
     # ── Pointer + display introspection ─────────────────────────
 
     def test_move_cursor(self):

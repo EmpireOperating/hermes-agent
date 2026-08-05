@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -178,6 +178,12 @@ class DashboardAuthProvider(ABC):
     # supports_token.
     supports_session: bool = True
 
+    # Opt-in for providers that can authenticate a request from a trusted
+    # transport or reverse proxy, independently of cookies and bearer tokens.
+    # Providers own validation of their proxy evidence and return a normal
+    # Session so downstream routes keep the same identity contract.
+    supports_request_identity: bool = False
+
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...
 
@@ -262,6 +268,15 @@ class DashboardAuthProvider(ABC):
             f"{type(self).__name__} does not support token auth "
             "(set supports_token = True and override verify_token)"
         )
+
+    def authenticate_request(self, *, request: Any) -> "Optional[Session]":
+        """Return a trusted transport identity or ``None``.
+
+        Called only when ``supports_request_identity`` is true. A provider
+        must fail closed for missing, malformed, or spoofable proxy evidence.
+        Existing providers remain unaffected by this default implementation.
+        """
+        return None
 
 
 def assert_protocol_compliance(cls: type) -> None:

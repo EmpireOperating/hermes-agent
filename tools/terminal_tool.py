@@ -1040,7 +1040,9 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 
     try:
         from tools.environments.docker import (
-            reap_orphan_containers, _get_active_profile_name,
+            reap_dead_owner_nonpersistent_containers,
+            reap_orphan_containers,
+            _get_active_profile_name,
         )
     except ImportError:
         return
@@ -1049,6 +1051,10 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
         removed = reap_orphan_containers(
             max_age_seconds=max_age, profile_filter=profile,
         )
+        if not container_config.get("docker_persist_across_processes", True):
+            removed += reap_dead_owner_nonpersistent_containers(
+                profile_filter=profile,
+            )
         if removed:
             logger.info(
                 "Docker orphan reaper removed %d stale container(s) for profile %s",
@@ -1715,14 +1721,20 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
+    container_task_id = _resolve_container_task_id(task_id)
     env = None
     with _env_lock:
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
+        if env is None and container_task_id != task_id:
+            env = _active_environments.pop(container_task_id, None)
+            _last_activity.pop(container_task_id, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
         _creation_locks.pop(task_id, None)
+        if container_task_id != task_id:
+            _creation_locks.pop(container_task_id, None)
 
     # Invalidate stale file_ops cache entry
     try:

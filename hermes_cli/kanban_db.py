@@ -5861,6 +5861,55 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def _sol_task_workspace_root() -> Path:
+    """Return Sol's dedicated host root for disposable task clones."""
+    from hermes_cli.profiles import resolve_profile_env
+    return Path(resolve_profile_env("sol-sandbox")).parent / "sol-task-workspaces"
+
+
+def _mission_repository_for_task(conn: sqlite3.Connection, task_id: str) -> Path:
+    """Resolve a task's immutable mission repository, never task-provided text."""
+    try:
+        row = conn.execute(
+            """
+            SELECT m.repo_root FROM kanban_mission_tasks mt
+            JOIN kanban_missions m ON m.id = mt.mission_id
+            WHERE mt.task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Sol workspace provisioning cannot read mission receipt: {exc}") from exc
+    repo_root = str(row["repo_root"] or "").strip() if row is not None else ""
+    source = Path(repo_root).expanduser().resolve(strict=False) if repo_root else None
+    if source is None or _git_toplevel(source) is None:
+        raise ValueError(f"Sol workspace provisioning requires task {task_id} to have a registered mission repository")
+    return source
+
+
+def _provision_sol_task_workspace(conn: sqlite3.Connection, task: Task) -> Path:
+    """Create/reuse a self-contained clone suitable for a Docker-only mount."""
+    source = _mission_repository_for_task(conn, task.id)
+    root = _sol_task_workspace_root().resolve(strict=False)
+    target = (root / task.id).resolve(strict=False)
+    if target.parent != root:
+        raise ValueError(f"Sol workspace provisioning rejected unsafe task path for {task.id}")
+    if target.exists():
+        if not (target / ".git").is_dir() or _git_toplevel(target) != target:
+            raise ValueError(f"Sol workspace provisioning found invalid managed clone at {target}")
+        return target
+    root.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "clone", "--no-hardlinks", str(source), str(target)],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    if result.returncode != 0 or not (target / ".git").is_dir() or _git_toplevel(target) != target:
+        shutil.rmtree(target, ignore_errors=True)
+        detail = (result.stderr or result.stdout or "git clone failed").strip()
+        raise ValueError(f"Sol workspace provisioning failed for {task.id}: {detail}")
+    return target
+
+
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
@@ -7574,6 +7623,17 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        if claimed.assignee == "sol-sandbox":
+            try:
+                workspace = _provision_sol_task_workspace(conn, claimed)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"workspace provisioning: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":

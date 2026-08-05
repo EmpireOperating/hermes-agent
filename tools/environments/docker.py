@@ -232,6 +232,79 @@ def reap_orphan_containers(
     return removed
 
 
+def reap_dead_owner_nonpersistent_containers(
+    *,
+    profile_filter: str | None = None,
+    docker_exe: str | None = None,
+) -> int:
+    """Remove running non-persistent containers whose creating process died.
+
+    This is deliberately separate from :func:`reap_orphan_containers`: a
+    running container can be a live sibling's sandbox and must never be
+    removed based on age alone. Containers created by current Hermes versions
+    carry ``hermes-owner-pid``; we reap only when that exact process no longer
+    exists. Containers without the label are left for explicit operator
+    cleanup, preserving the safety posture for legacy containers.
+    """
+    docker = docker_exe or find_docker() or "docker"
+    filters = ["--filter", "label=hermes-agent=1", "--filter", "status=running"]
+    if profile_filter:
+        filters.extend(["--filter", f"label=hermes-profile={_sanitize_label_value(profile_filter)}"])
+    try:
+        listing = subprocess.run(
+            [docker, "ps", "-a", *filters, "--format", "{{.ID}}"],
+            capture_output=True, text=True, timeout=15, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.debug("non-persistent orphan reaper docker ps failed: %s", e)
+        return 0
+    if listing.returncode != 0:
+        logger.debug(
+            "non-persistent orphan reaper docker ps returned %d: %s",
+            listing.returncode, listing.stderr.strip(),
+        )
+        return 0
+
+    removed = 0
+    for cid in (line.strip() for line in listing.stdout.splitlines() if line.strip()):
+        try:
+            inspected = subprocess.run(
+                [docker, "inspect", "--format", '{{index .Config.Labels "hermes-owner-pid"}}', cid],
+                capture_output=True, text=True, timeout=10, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("non-persistent orphan reaper inspect %s failed: %s", cid[:12], e)
+            continue
+        owner_pid_text = inspected.stdout.strip() if inspected.returncode == 0 else ""
+        if not owner_pid_text.isdigit():
+            continue
+        try:
+            os.kill(int(owner_pid_text), 0)
+        except ProcessLookupError:
+            pass
+        except (PermissionError, ValueError, OverflowError):
+            continue
+        else:
+            continue
+        try:
+            result = subprocess.run(
+                [docker, "rm", "-f", cid],
+                capture_output=True, text=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                removed += 1
+                logger.info(
+                    "Reaped non-persistent container %s with dead owner pid %s",
+                    cid[:12], owner_pid_text,
+                )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("non-persistent orphan reaper rm %s failed: %s", cid[:12], e)
+    return removed
+
+
 def _container_finished_at(docker_exe: str, container_id: str):
     """Parse ``docker inspect`` FinishedAt for *container_id*.
 
@@ -869,6 +942,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"hermes-owner-pid={os.getpid()}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -880,6 +954,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            "hermes-owner-pid": str(os.getpid()),
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived

@@ -22,7 +22,7 @@ from typing import Awaitable, Callable
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from hermes_cli.dashboard_auth import list_session_providers
+from hermes_cli.dashboard_auth import list_request_identity_providers, list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
 from hermes_cli.dashboard_auth.cookies import (
@@ -269,6 +269,27 @@ async def gated_auth_middleware(
     path = request.url.path
     if _path_is_public(path):
         return await call_next(request)
+
+    # Private-network deployments may authenticate the transport before it
+    # reaches the dashboard. Only explicitly opted-in providers are asked to
+    # inspect the request; each provider must validate its own proxy evidence.
+    # A returned Session unlocks the same ticketed-WebSocket path as a cookie
+    # session without exposing a long-lived dashboard credential to a browser.
+    for provider in list_request_identity_providers():
+        try:
+            session = provider.authenticate_request(request=request)
+        except ProviderError as exc:
+            _log.warning(
+                "dashboard-auth: provider %r unavailable during request identity: %s",
+                provider.name, exc,
+            )
+            return JSONResponse(
+                {"detail": f"Auth provider {provider.name!r} unavailable"},
+                status_code=503,
+            )
+        if session is not None:
+            request.state.session = session
+            return await call_next(request)
 
     at, _rt = read_session_cookies(request)
     if not at and not _rt:

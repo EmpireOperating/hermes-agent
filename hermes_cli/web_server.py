@@ -15256,7 +15256,22 @@ def start_server(
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    # A private reverse proxy can terminate HTTPS and authenticate the
+    # transport while this process remains safely bound to loopback. In that
+    # topology the host alone cannot enable the dashboard gate, so operators
+    # may explicitly request it in config. The default remains unchanged.
+    try:
+        from hermes_cli.config import load_config
+
+        dashboard_config = load_config().get("dashboard", {})
+        force_auth = (
+            bool(dashboard_config.get("require_auth", False))
+            if isinstance(dashboard_config, dict)
+            else False
+        )
+    except Exception:
+        force_auth = False
+    app.state.auth_required = should_require_auth(host) or force_auth
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public

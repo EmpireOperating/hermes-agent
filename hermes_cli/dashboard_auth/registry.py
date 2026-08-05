@@ -75,6 +75,15 @@ def list_session_providers() -> List[DashboardAuthProvider]:
         return [p for p in _providers.values() if getattr(p, "supports_session", True)]
 
 
+def list_request_identity_providers() -> List[DashboardAuthProvider]:
+    """Providers that can authenticate a request through trusted transport."""
+    with _lock:
+        return [
+            p for p in _providers.values()
+            if getattr(p, "supports_request_identity", False)
+        ]
+
+
 def clear_providers() -> None:
     """Test-only: drop all registrations."""
     with _lock:

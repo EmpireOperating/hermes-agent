@@ -310,6 +310,17 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     return text or f"buzz CLI failed with exit code {returncode}"
 
 
+def _cli_retryable(raw: str, exit_code: int) -> bool:
+    """Honor structured CLI retry guidance, with legacy exit-code fallback."""
+    try:
+        payload = json.loads((raw or "").strip())
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("retryable"), bool):
+        return payload["retryable"]
+    return exit_code == 2
+
+
 def _parse_json_list(stdout: str) -> List[dict]:
     """Parse CLI stdout expected to be a JSON array of objects."""
     try:
@@ -689,6 +700,59 @@ class BuzzAdapter(BasePlatformAdapter):
             ProcessingOutcome.CANCELLED: "🛑",
         }[outcome]
         await self.send_reaction(chat_id, message_id, terminal_emoji)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a local document through the Buzz CLI."""
+        local = Path(file_path).expanduser()
+        if not local.is_file():
+            return SendResult(success=False, error="Attachment file is unavailable")
+
+        args = [
+            "messages", "send",
+            "--channel", str(chat_id),
+            "--file", str(local),
+            "--content", "-",
+        ]
+        reply_target = reply_to or (metadata or {}).get("thread_id")
+        if reply_target:
+            args += ["--reply-to", str(reply_target)]
+        code, out, err = await self._run_cli(args, input_text=caption or "")
+        if code != 0:
+            error = _cli_error_message(err, code).replace(str(local), local.name)
+            return SendResult(
+                success=False,
+                error=error,
+                retryable=_cli_retryable(err, code),
+            )
+        try:
+            data = json.loads(out or "")
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            return SendResult(success=False, error="Invalid response from Buzz CLI")
+        event_id = data.get("event_id")
+        if data.get("accepted") is not True or not isinstance(event_id, str) or not event_id:
+            error = str(data.get("message") or "Incomplete response from Buzz CLI")
+            return SendResult(
+                success=False,
+                error=error.replace(str(local), local.name),
+                raw_response=data,
+            )
+        self._mark_seen(str(chat_id), event_id)
+        return SendResult(
+            success=True,
+            message_id=event_id,
+            raw_response=data,
+        )
 
     async def send_image(
         self,

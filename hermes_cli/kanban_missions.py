@@ -966,6 +966,20 @@ def sign_mission_completion(
     summary_text = _required(summary, "summary")
     if not evidence:
         raise ValueError("completion evidence is required")
+    role_counts = {
+        row["role"]: int(row["count"])
+        for row in conn.execute(
+            "SELECT role, COUNT(*) AS count FROM kanban_mission_tasks "
+            "WHERE mission_id = ? AND role != 'root' GROUP BY role",
+            (mission_id,),
+        ).fetchall()
+    }
+    if role_counts.get("code", 0) < 1:
+        raise ValueError("mission completion requires at least one implementation task")
+    if role_counts.get("integration", 0) < 1:
+        raise ValueError("mission completion requires at least one integration task")
+    if role_counts.get("qa", 0) < 1:
+        raise ValueError("mission completion requires at least one independent QA task")
     pending = conn.execute(
         """
         SELECT mt.task_id, mt.role, t.status,

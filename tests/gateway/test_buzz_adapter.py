@@ -528,6 +528,158 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_file_with_caption_and_reply(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-document"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(
+            CHANNEL,
+            str(document),
+            caption="handoff",
+            reply_to="root-event",
+        )
+
+        assert result.success is True
+        assert result.message_id == "evt-document"
+        args, stdin_text = cli.calls[0]
+        assert args[:2] == ["messages", "send"]
+        assert args[args.index("--channel") + 1] == CHANNEL
+        assert args[args.index("--file") + 1] == str(document)
+        assert args[args.index("--content") + 1] == "-"
+        assert args[args.index("--reply-to") + 1] == "root-event"
+        assert stdin_text == "handoff"
+        assert "handoff" not in args
+        assert "evt-document" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_send_document_uses_metadata_thread_when_reply_omitted(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-thread"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(
+            CHANNEL,
+            str(document),
+            metadata={"thread_id": "metadata-root"},
+        )
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "metadata-root"
+
+    @pytest.mark.asyncio
+    async def test_send_document_explicit_reply_overrides_metadata_thread(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-explicit"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(
+            CHANNEL,
+            str(document),
+            reply_to="explicit-root",
+            metadata={"thread_id": "metadata-root"},
+        )
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args.count("--reply-to") == 1
+        assert args[args.index("--reply-to") + 1] == "explicit-root"
+
+    @pytest.mark.asyncio
+    async def test_send_document_sanitizes_cli_error_path(self, tmp_path):
+        document = tmp_path / "private" / "handoff.txt"
+        document.parent.mkdir()
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=2,
+            stderr=json.dumps(
+                {
+                    "error": "network",
+                    "message": f"upload failed for {document}: relay unavailable",
+                    "retryable": True,
+                }
+            ),
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is False
+        assert result.retryable is True
+        assert str(document) not in result.error
+        assert "handoff.txt" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_document_honors_non_retryable_cli_error(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=2,
+            stderr=json.dumps(
+                {
+                    "error": "delivery_unknown",
+                    "message": "relay may already have accepted the event",
+                    "retryable": False,
+                }
+            ),
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is False
+        assert result.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejects_missing_path_without_cli(self, tmp_path):
+        missing = tmp_path / "private" / "missing.txt"
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(missing))
+
+        assert result.success is False
+        assert str(missing) not in result.error
+        assert cli.calls == []
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejects_malformed_success_output(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", "not-json")
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is False
+        assert result.retryable is False
+        assert "response" in result.error.lower()
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 

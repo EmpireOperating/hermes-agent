@@ -1161,13 +1161,23 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             pid_int, window_id_int = int(pid), int(window_id)
         except (TypeError, ValueError):
             continue
+        # Wayland compositors legitimately omit z-order. Normalize it to None
+        # rather than leaving an arbitrary value in the downstream sort key:
+        # comparing two None values raises on Python 3, which previously made
+        # every capture fail on wlroots desktops even when the windows were
+        # otherwise fully targetable.
+        raw_z_index = w.get("z_index")
+        try:
+            z_index = int(raw_z_index) if raw_z_index is not None else None
+        except (TypeError, ValueError):
+            z_index = None
         windows.append({
             "app_name": str(w.get("app_name") or w.get("title") or ""),
             "pid": pid_int,
             "window_id": window_id_int,
             "off_screen": not w.get("is_on_screen", True),
             "title": str(w.get("title") or ""),
-            "z_index": w.get("z_index", 0),
+            "z_index": z_index,
         })
     return windows
 
@@ -1186,6 +1196,10 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
+        # ``focus_app(..., raise_window=True)`` explicitly escalates keyboard
+        # delivery for this exact target. Binding it to the PID/window pair
+        # prevents a later background selection from stealing focus.
+        self._foreground_input_target: Optional[Tuple[int, int]] = None
         # Surface 6 of NousResearch/hermes-agent#47072: per-snapshot
         # `element_index -> element_token` map populated on capture().
         # Action tools (click/scroll/set_value/...) attach the matching
@@ -1293,8 +1307,13 @@ class CuaDriverBackend(ComputerUseBackend):
         def _windows_from(out: Dict[str, Any]) -> List[Dict[str, Any]]:
             raw_ = (out.get("structuredContent") or {}).get("windows") or []
             wins_ = _ingest_windows(raw_)
-            # Sort by z_index descending (lowest z_index = frontmost on macOS).
-            wins_.sort(key=lambda w: w["z_index"])
+            # Lowest z_index is frontmost on macOS. wlroots can report null
+            # z-order for every window; keep those entries in driver order
+            # rather than comparing None values (which crashes Python's sort).
+            wins_.sort(key=lambda w: (
+                w["z_index"] is None,
+                w["z_index"] if w["z_index"] is not None else 0,
+            ))
             return wins_
 
         windows = _windows_from(lw_out)
@@ -1701,16 +1720,96 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._action("scroll", args)
 
     # ── Keyboard ───────────────────────────────────────────────────
+    def _wtype_foreground_fallback(
+        self,
+        failed: ActionResult,
+        *,
+        text: Optional[str] = None,
+        key_name: Optional[str] = None,
+        modifiers: Optional[List[str]] = None,
+    ) -> ActionResult:
+        """Use wtype only for an explicitly foregrounded Linux target.
+
+        Hyprland's portal has InputCapture but not RemoteDesktop, so
+        cua-driver's libei keyboard worker cannot obtain an EIS channel. Its
+        virtual-keyboard protocol is available through ``wtype``. This must
+        remain foreground-only: wtype cannot safely target a background window.
+        """
+        if sys.platform != "linux" or self._foreground_input_target != (
+            self._active_pid, self._active_window_id,
+        ):
+            return failed
+        message = failed.message.lower()
+        if not any(token in message for token in (
+            "libei", "remote desktop", "eis", "input backend did not become ready",
+            "background_unavailable", "disconnected channel",
+        )):
+            return failed
+        wtype = shutil.which("wtype")
+        if not wtype:
+            return failed
+
+        command = [wtype]
+        if text is not None:
+            command.append(text)
+        elif key_name:
+            modifier_map = {"cmd": "logo", "option": "alt", "ctrl": "ctrl", "shift": "shift"}
+            mapped = [modifier_map.get(modifier, modifier) for modifier in modifiers or []]
+            for modifier in mapped:
+                command.extend(("-M", modifier))
+            command.extend(("-k", key_name))
+            for modifier in reversed(mapped):
+                command.extend(("-m", modifier))
+        else:
+            return failed
+
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+
+            proc = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=_sanitize_subprocess_env(cua_driver_child_env()),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("wtype foreground fallback failed to launch: %s", exc)
+            return failed
+        if proc.returncode != 0:
+            logger.warning("wtype foreground fallback failed: %s", (proc.stderr or proc.stdout).strip())
+            return failed
+        logger.info("wtype foreground fallback delivered %s", failed.action)
+        return ActionResult(
+            ok=True,
+            action=failed.action,
+            message=(f"{failed.action} delivered through the foreground Wayland fallback "
+                     "after cua-driver's libei input path was unavailable."),
+            meta={"fallback": "wtype"},
+        )
+
     def type_text(self, text: str) -> ActionResult:
         pid = self._active_pid
-        if pid is None:
+        window_id = self._active_window_id
+        if pid is None or window_id is None:
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
-        return self._action("type_text", {"pid": pid, "text": text})
+        args: Dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "text": text,
+        }
+        if self._foreground_input_target == (pid, window_id):
+            args["delivery_mode"] = "foreground"
+        return self._wtype_foreground_fallback(
+            self._action("type_text", args), text=text,
+        )
 
     def key(self, keys: str) -> ActionResult:
         pid = self._active_pid
-        if pid is None:
+        window_id = self._active_window_id
+        if pid is None or window_id is None:
             return ActionResult(ok=False, action="key",
                                 message="No active window — call capture() first.")
 
@@ -1721,9 +1820,27 @@ class CuaDriverBackend(ComputerUseBackend):
 
         if modifiers:
             # hotkey requires at least one modifier + one key.
-            return self._action("hotkey", {"pid": pid, "keys": modifiers + [key_name]})
+            args: Dict[str, Any] = {
+                "pid": pid,
+                "window_id": window_id,
+                "keys": modifiers + [key_name],
+            }
+            if self._foreground_input_target == (pid, window_id):
+                args["delivery_mode"] = "foreground"
+            return self._wtype_foreground_fallback(
+                self._action("hotkey", args), key_name=key_name, modifiers=modifiers,
+            )
         else:
-            return self._action("press_key", {"pid": pid, "key": key_name})
+            args = {
+                "pid": pid,
+                "window_id": window_id,
+                "key": key_name,
+            }
+            if self._foreground_input_target == (pid, window_id):
+                args["delivery_mode"] = "foreground"
+            return self._wtype_foreground_fallback(
+                self._action("press_key", args), key_name=key_name,
+            )
 
     # ── Value setter ────────────────────────────────────────────────
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
@@ -1763,17 +1880,13 @@ class CuaDriverBackend(ComputerUseBackend):
         return []
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
-        """Target an app for subsequent actions without stealing system focus.
+        """Target an app, optionally activating its selected window.
 
-        cua-driver background-automation never needs to bring a window to the
-        front: capture(app=...) already selects the right window via
-        list_windows. We implement focus_app as a pure window-selector —
-        enumerate on-screen windows, find the best match for *app*, and store
-        its pid/window_id so that subsequent click/type calls hit the right
-        process.
-
-        raise_window=True is intentionally ignored: stealing the user's focus
-        is exactly what this backend is designed to avoid.
+        The normal background path selects an on-screen window and preserves
+        its PID/window ID for subsequent actions without changing user focus.
+        ``raise_window=True`` is the explicit, approval-gated escape hatch for
+        platforms whose keyboard delivery requires the global foreground
+        window. It activates exactly the selected window through cua-driver.
         """
         lw_out = self._session.call_tool(
             "list_windows",
@@ -1781,7 +1894,13 @@ class CuaDriverBackend(ComputerUseBackend):
         )
         raw_windows = (lw_out.get("structuredContent") or {}).get("windows") or []
         windows = _ingest_windows(raw_windows)
-        windows.sort(key=lambda w: w["z_index"])
+        # wlroots/Hyprland can omit z-order for every window. Mirror capture's
+        # null-safe ordering so focus_app remains usable after a successful
+        # capture on those desktops.
+        windows.sort(key=lambda w: (
+            w["z_index"] is None,
+            w["z_index"] if w["z_index"] is not None else 0,
+        ))
 
         app_lower = app.lower()
         matched = [w for w in windows if app_lower in w["app_name"].lower()]
@@ -1794,6 +1913,39 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._last_app = target["app_name"]  # preserve for capture_after= follow-ups
+            self._foreground_input_target = None
+            if raise_window:
+                if self._active_pid is None or self._active_window_id is None:
+                    return ActionResult(
+                        ok=False,
+                        action="focus_app",
+                        message=(f"Targeted {target['app_name']} but cua-driver did not provide "
+                                 "a process ID for foreground activation."),
+                    )
+                activated = self.bring_to_front(
+                    pid=self._active_pid,
+                    window_id=self._active_window_id,
+                )
+                if not activated.ok:
+                    return ActionResult(
+                        ok=False,
+                        action="focus_app",
+                        message=(f"Targeted {target['app_name']} (pid {self._active_pid}, "
+                                 f"window {self._active_window_id}) but could not bring it "
+                                 f"to the foreground: {activated.message}"),
+                        meta=activated.meta,
+                    )
+                self._foreground_input_target = (
+                    self._active_pid,
+                    self._active_window_id,
+                )
+                return ActionResult(
+                    ok=True,
+                    action="focus_app",
+                    message=(f"Targeted and brought {target['app_name']} to the foreground "
+                             f"(pid {self._active_pid}, window {self._active_window_id})."),
+                    meta=activated.meta,
+                )
             return ActionResult(
                 ok=True, action="focus_app",
                 message=f"Targeted {target['app_name']} (pid {self._active_pid}, "

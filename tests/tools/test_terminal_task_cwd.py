@@ -15,6 +15,30 @@ def _minimal_terminal_config(cwd="/default"):
     }
 
 
+def test_cleanup_vm_uses_resolved_container_task_id(monkeypatch):
+    """A session-keyed close must tear down the shared default Docker env."""
+
+    class FakeEnv:
+        def __init__(self) -> None:
+            self.cleaned = False
+
+        def cleanup(self, *, force_remove=False) -> None:
+            self.cleaned = True
+
+    env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1.0})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {"default": object()})
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda task_id: "default")
+
+    terminal_tool.cleanup_vm("gateway-session")
+
+    assert env.cleaned
+    assert terminal_tool._active_environments == {}
+    assert terminal_tool._last_activity == {}
+    assert terminal_tool._creation_locks == {}
+
+
 def test_foreground_command_uses_registered_task_cwd_for_existing_environment(monkeypatch):
     """ACP can update task cwd after the local env exists; foreground must honor it."""
     calls = []

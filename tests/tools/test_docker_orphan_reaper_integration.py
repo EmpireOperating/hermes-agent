@@ -125,6 +125,29 @@ def test_maybe_reap_passes_current_profile_as_filter(monkeypatch):
     )
 
 
+def test_maybe_reap_checks_running_dead_owners_only_for_nonpersistent_docker(monkeypatch):
+    """Per-process Docker gets an owner-safe running-orphan sweep."""
+    _reset_reaper_gate()
+    calls = {"exited": 0, "running": 0}
+
+    def _fake_exited(**kwargs):
+        calls["exited"] += 1
+        return 0
+
+    def _fake_running(**kwargs):
+        calls["running"] += 1
+        return 0
+
+    with patch("tools.environments.docker.reap_orphan_containers", _fake_exited), \
+         patch("tools.environments.docker.reap_dead_owner_nonpersistent_containers", _fake_running):
+        terminal_tool._maybe_reap_docker_orphans({
+            "docker_orphan_reaper": True,
+            "docker_persist_across_processes": False,
+        })
+
+    assert calls == {"exited": 1, "running": 1}
+
+
 def test_maybe_reap_swallows_exceptions(monkeypatch):
     """A reaper crash (docker daemon down, parse error in helper) must NOT
     block env creation. The reaper is best-effort plumbing, not a critical

@@ -1287,6 +1287,56 @@ def _reaper_run_mock(monkeypatch, ps_ids: list[str], inspect_responses: dict[str
     return calls
 
 
+def test_reap_nonpersistent_running_container_with_dead_owner(monkeypatch):
+    """Only an explicitly dead owner permits cleanup of a running container."""
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "ps":
+            return subprocess.CompletedProcess(cmd, 0, stdout="dead-owner\n", stderr="")
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(cmd, 0, stdout="424242\n", stderr="")
+        if cmd[1] == "rm":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    monkeypatch.setattr(docker_env.os, "kill", lambda pid, signal: (_ for _ in ()).throw(ProcessLookupError()))
+
+    removed = docker_env.reap_dead_owner_nonpersistent_containers(
+        profile_filter="sol-sandbox", docker_exe="/usr/bin/docker",
+    )
+
+    assert removed == 1
+    assert [cmd[1] for cmd in calls] == ["ps", "inspect", "rm"]
+    assert "status=running" in calls[0]
+    assert "label=hermes-profile=sol-sandbox" in calls[0]
+
+
+def test_reap_nonpersistent_running_container_spares_live_owner(monkeypatch):
+    """A running container with a live creator PID must never be removed."""
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "ps":
+            return subprocess.CompletedProcess(cmd, 0, stdout="live-owner\n", stderr="")
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(cmd, 0, stdout="424242\n", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    monkeypatch.setattr(docker_env.os, "kill", lambda pid, signal: None)
+
+    removed = docker_env.reap_dead_owner_nonpersistent_containers(
+        profile_filter="sol-sandbox", docker_exe="/usr/bin/docker",
+    )
+
+    assert removed == 0
+    assert [cmd[1] for cmd in calls] == ["ps", "inspect"]
+
+
 def test_reap_orphan_returns_zero_when_no_matches(monkeypatch):
     """No labeled containers → no rm calls, returns 0. Establishes the
     happy-path baseline for the orphan reaper (issue #20561)."""
