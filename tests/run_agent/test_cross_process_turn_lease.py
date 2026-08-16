@@ -7,7 +7,10 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from agent import relay_runtime
+from hermes_cli.context_publication import ContextPublicationError
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -125,6 +128,98 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         and "loading the latest transcript" in text
         for kind, text in status_events
     )
+
+
+def test_protected_publication_resolves_tip_after_immediate_acquisition(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    agent._conversation_root_id = lambda: "root-1"
+    observed = []
+    authorization = object()
+
+    def acquire_immediately(session_id, holder, **kwargs):
+        del kwargs
+        db.events.append(("acquire", session_id, holder))
+        return True
+
+    def consume(_agent, content, request):
+        observed.append(("consume", _agent.session_id, content, request))
+        return content
+
+    def run(_agent, message, _system, history, *_args, **_kwargs):
+        observed.append(("run", _agent.session_id, message, history))
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    db.acquire_session_turn_lease = acquire_immediately
+    monkeypatch.setattr(
+        "hermes_cli.context_publication.consume_context_publication_for_turn",
+        consume,
+    )
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", run)
+
+    result = AIAgent.run_conversation(
+        agent,
+        "protected content",
+        conversation_history=[{"role": "user", "content": "stale"}],
+        context_publication_authorization=authorization,
+    )
+
+    assert result["final_response"] == "ok"
+    assert observed == [
+        ("consume", "compressed-tip", "protected content", authorization),
+        (
+            "run",
+            "compressed-tip",
+            "protected content",
+            [{"role": "user", "content": "durable latest"}],
+        ),
+    ]
+    assert [event[0] for event in db.events] == [
+        "acquire",
+        "resolve",
+        "reload",
+        "release",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["persistence_disabled", "missing", "unsupported"])
+def test_protected_publication_requires_durable_lease_admission(
+    monkeypatch, failure
+):
+    if failure == "unsupported":
+        class _UnsupportedDB:
+            def get_session(self, session_id):
+                return {"id": session_id}
+
+        db = _UnsupportedDB()
+    else:
+        db = _DB(session_exists=failure != "missing")
+    agent = _agent_with_db(db)
+    if failure == "persistence_disabled":
+        agent._persist_disabled = True
+
+    monkeypatch.setattr(
+        "hermes_cli.context_publication.consume_context_publication_for_turn",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("authority must not be consumed")
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("turn must not start")
+        ),
+    )
+
+    with pytest.raises(
+        ContextPublicationError,
+        match="authorization_session_unavailable",
+    ):
+        AIAgent.run_conversation(
+            agent,
+            "protected content",
+            context_publication_authorization=object(),
+        )
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):

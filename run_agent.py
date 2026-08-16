@@ -8332,6 +8332,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        context_publication_authorization: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8433,6 +8434,19 @@ class AIAgent:
                         exc_info=True,
                     )
                     _durable_session_exists = True
+            _durable_lease_supported = callable(
+                getattr(type(_turn_db), "acquire_session_turn_lease", None)
+            )
+            if context_publication_authorization is not None and (
+                _turn_db is None
+                or not session_id
+                or getattr(self, "_persist_disabled", False)
+                or not _durable_session_exists
+                or not _durable_lease_supported
+            ):
+                from hermes_cli.context_publication import ContextPublicationError
+
+                raise ContextPublicationError("authorization_session_unavailable")
             if (
                 _turn_db is not None
                 and session_id
@@ -8556,13 +8570,11 @@ class AIAgent:
                         "Session is free; loading the latest transcript..."
                     )
 
-                # The holder may have compressed and rotated the session while
-                # this process waited. Resolve and reload only AFTER admission;
-                # a caller-provided in-memory snapshot is necessarily stale.
-                # Skip when acquisition was immediate — no other process held
-                # the lease, so the in-memory history is current and reloading
-                # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
+                # Protected publication must always resolve authoritative state
+                # after admission: an already-finished compressor may have
+                # rotated the caller's parent before an immediate acquisition.
+                # Ordinary turns retain the immediate-acquisition cache fast path.
+                if _lease_waited or context_publication_authorization is not None:
                     latest_session_id = _turn_db.resolve_resume_session_id(session_id)
                     if latest_session_id:
                         self.session_id = latest_session_id
@@ -8685,6 +8697,20 @@ class AIAgent:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
                         durable_turn_lease_thread.start()
+                    if context_publication_authorization is not None:
+                        from hermes_cli.context_publication import (
+                            consume_context_publication_for_turn,
+                        )
+
+                        # This is the authorization linearization point: the
+                        # canonical turn lease and latest session tip are live,
+                        # while build_turn_context() has not appended, persisted,
+                        # or exposed the protected content to a model.
+                        user_message = consume_context_publication_for_turn(
+                            self,
+                            user_message,
+                            context_publication_authorization,
+                        )
                     result = run_conversation(
                         self,
                         user_message,
