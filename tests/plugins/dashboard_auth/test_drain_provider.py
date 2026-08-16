@@ -145,8 +145,35 @@ class TestRegister:
         assert isinstance(provider, drain.DrainSecretProvider)
         assert provider.verify_token(token=s) is not None
         assert drain.LAST_SKIP_REASON == ""
-        # The drain endpoint is now token-authable.
-        assert token_auth.is_token_route(drain.DRAIN_ROUTE_PATH)
+        ctx.register_dashboard_token_route.assert_called_once_with(
+            drain.DRAIN_ROUTE_PATH,
+            provider=provider.name,
+            required_scopes=("drain",),
+        )
+
+    def test_provider_registration_failure_leaves_route_disabled(self, drain, monkeypatch):
+        monkeypatch.setenv("HERMES_DASHBOARD_DRAIN_SECRET", _strong_secret())
+        monkeypatch.setattr(drain, "_load_config_drain_auth_section", lambda: {})
+        ctx = MagicMock()
+        ctx.register_dashboard_auth_provider.return_value = None
+
+        drain.register(ctx)
+
+        ctx.register_dashboard_token_route.assert_not_called()
+        assert "registration failed" in drain.LAST_SKIP_REASON
+
+    def test_route_registration_failure_rolls_back_provider(self, drain, monkeypatch):
+        monkeypatch.setenv("HERMES_DASHBOARD_DRAIN_SECRET", _strong_secret())
+        monkeypatch.setattr(drain, "_load_config_drain_auth_section", lambda: {})
+        ctx = MagicMock()
+        provider_registration = MagicMock()
+        ctx.register_dashboard_auth_provider.return_value = provider_registration
+        ctx.register_dashboard_token_route.side_effect = ValueError("invalid policy")
+
+        drain.register(ctx)
+
+        provider_registration.dispose.assert_called_once_with()
+        assert "route registration failed" in drain.LAST_SKIP_REASON.lower()
 
     def test_config_scope_applied(self, drain, monkeypatch):
         s = _strong_secret()

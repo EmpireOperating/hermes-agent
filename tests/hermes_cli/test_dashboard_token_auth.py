@@ -225,13 +225,152 @@ async def _call_next_ok(request):
 
 
 
+def test_legacy_unowned_registration_is_source_compatible_but_inert(caplog):
+    registration = token_auth.register_token_route("/api/legacy-machine")
+
+    assert registration is None
+    assert not token_auth.is_token_route("/api/legacy-machine")
+    assert "ignored unowned token route" in caplog.text
+
+
 def test_seam_rejects_wrong_token_401():
     register_provider(_TokenProvider(secret="good"))
-    token_auth.register_token_route("/api/gateway/drain")
+    token_auth.register_token_route("/api/gateway/drain", provider="tok")
     req = _FakeRequest(
         path="/api/gateway/drain", headers={"authorization": "Bearer bad"}
     )
     resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
     assert resp.status_code == 401
+
+
+def test_route_provider_binding_rejects_a_token_from_another_provider():
+    other = _TokenProvider(secret="shared", scopes=("empire.poll",))
+    other.name = "empire-client"
+    register_provider(other)
+    register_provider(_TokenProvider(secret="drain-secret", scopes=("drain",)))
+    token_auth.register_token_route(
+        "/api/gateway/drain", provider="tok", required_scopes=("drain",)
+    )
+    req = _FakeRequest(
+        path="/api/gateway/drain", headers={"authorization": "Bearer shared"}
+    )
+
+    resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
+
+    assert resp.status_code == 401
+    assert not hasattr(req.state, "token_authenticated")
+
+
+def test_route_scope_binding_rejects_an_authenticated_under_scoped_principal():
+    register_provider(_TokenProvider(secret="good", scopes=("poll",)))
+    token_auth.register_token_route(
+        "/api/client/decision", provider="tok", required_scopes=("decision",)
+    )
+    req = _FakeRequest(
+        path="/api/client/decision", headers={"authorization": "Bearer good"}
+    )
+
+    resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
+
+    assert resp.status_code == 403
+    assert not hasattr(req.state, "token_authenticated")
+
+
+def test_route_provider_and_scope_binding_accepts_only_the_exact_principal():
+    register_provider(_TokenProvider(secret="good", scopes=("decision", "body:abc")))
+    token_auth.register_token_route(
+        "/api/client/decision",
+        provider="tok",
+        required_scopes=("decision", "body:abc"),
+    )
+    req = _FakeRequest(
+        path="/api/client/decision", headers={"authorization": "Bearer good"}
+    )
+
+    resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
+
+    assert resp.status_code == 200
+    assert req.state.token_authenticated is True
+    assert req.state.token_principal.provider == "tok"
+
+
+def test_conflicting_token_route_registration_poisoning_is_fail_closed_and_disposable():
+    first_provider = _TokenProvider(secret="first-token")
+    first_provider.name = "first"
+    second_provider = _TokenProvider(secret="second-token")
+    second_provider.name = "second"
+    register_provider(first_provider)
+    register_provider(second_provider)
+    first = token_auth.register_token_route("/api/shared", provider="first")
+    second = token_auth.register_token_route("/api/shared", provider="second")
+    request = _FakeRequest(
+        path="/api/shared", headers={"authorization": "Bearer first-token"}
+    )
+
+    response = _run(token_auth.token_auth_middleware(request, _call_next_ok))
+
+    assert response.status_code == 503
+    assert not hasattr(request.state, "token_authenticated")
+
+    second.dispose()
+    request = _FakeRequest(
+        path="/api/shared", headers={"authorization": "Bearer first-token"}
+    )
+    response = _run(token_auth.token_auth_middleware(request, _call_next_ok))
+    assert response.status_code == 200
+    assert request.state.token_authenticated is True
+
+    first.dispose()
+    assert not token_auth.is_token_route("/api/shared")
+
+
+def test_scope_order_is_canonical_and_profile_registrations_are_isolated():
+    first = token_auth.register_token_route(
+        "/api/scoped",
+        provider="tok",
+        required_scopes=("read", "write"),
+        scope="profile-a",
+    )
+    second = token_auth.register_token_route(
+        "/api/scoped",
+        provider="tok",
+        required_scopes=("write", "read"),
+        scope="profile-a",
+    )
+    other = token_auth.register_token_route(
+        "/api/scoped", provider="other", scope="profile-b"
+    )
+
+    assert token_auth.is_token_route("/api/scoped", scope="profile-a")
+    policy, conflict = token_auth._token_route_policy("/api/scoped", scope="profile-a")
+    assert conflict is False
+    assert policy is not None
+    assert policy.required_scopes == frozenset({"read", "write"})
+    assert token_auth._token_route_policy("/api/scoped", scope="profile-b")[0].provider == "other"
+
+    first.dispose()
+    second.dispose()
+    other.dispose()
+
+
+def test_provider_cannot_spoof_another_provider_in_its_principal():
+    provider = _TokenProvider(secret="good")
+    provider.name = "owner"
+
+    def spoofed(*, token):
+        assert token == "good"
+        return TokenPrincipal(provider="other", principal="machine")
+
+    provider.verify_token = spoofed
+    register_provider(provider)
+    token_auth.register_token_route("/api/owned", provider="owner")
+    request = _FakeRequest(
+        path="/api/owned", headers={"authorization": "Bearer good"}
+    )
+
+    response = _run(token_auth.token_auth_middleware(request, _call_next_ok))
+
+    assert response.status_code == 401
+    assert not hasattr(request.state, "token_authenticated")
 
 
