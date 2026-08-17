@@ -84,6 +84,12 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
+_CONTEXT_PUBLICATION_REQUIRED_KEY = (
+    web.RequestKey("context_publication_required", bool)
+    if AIOHTTP_AVAILABLE
+    else "_hermes_context_publication_required"
+)
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
@@ -2072,6 +2078,16 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
+            (
+                "POST",
+                "/api/sessions/{session_id}/context-publications/authorize",
+                self._handle_context_publication_authorize,
+            ),
+            (
+                "POST",
+                "/api/sessions/{session_id}/context-publications",
+                self._handle_context_publication_chat,
+            ),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -3156,6 +3172,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
+                "context_publication_authorization": True,
                 "session_fork": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
@@ -3192,6 +3209,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "context_publication_authorize": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/context-publications/authorize",
+                },
+                "context_publication": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/context-publications",
+                },
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
             },
         })
@@ -3684,6 +3709,179 @@ class APIServerAdapter(BasePlatformAdapter):
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
+    @staticmethod
+    def _context_publication_error_response(exc: Exception) -> "web.Response":
+        code = str(exc) or "context_publication_failed"
+        status = {
+            "policy_denied": 403,
+            "policy_unavailable": 503,
+            "policy_error": 503,
+            "policy_malformed": 503,
+            "policy_timeout": 503,
+            "policy_capacity": 503,
+            "policy_conflict": 409,
+            "policy_lifecycle_drift": 409,
+            "authorization_capacity": 429,
+            "authorization_invalid": 409,
+            "authorization_expired": 409,
+            "authorization_replayed": 409,
+            "authorization_provider_drift": 409,
+            "authorization_process_drift": 409,
+            "authorization_host_drift": 409,
+            "authorization_session_drift": 409,
+            "authorization_session_unavailable": 409,
+            "authorization_binding_drift": 409,
+            "preparation_stale": 409,
+        }.get(code, 400)
+        return web.json_response(
+            _openai_error(
+                "Context publication was not authorized",
+                code=code,
+            ),
+            status=status,
+        )
+
+    def _context_publication_request(
+        self,
+        request: "web.Request",
+        body: Dict[str, Any],
+    ) -> tuple[Optional[Any], Optional["web.Response"]]:
+        """Parse authorization only on a host-selected protected route."""
+        required = request.get(_CONTEXT_PUBLICATION_REQUIRED_KEY) is True
+        supplied = "publicationAuthorization" in body
+        if supplied and not required:
+            return None, web.json_response(
+                _openai_error(
+                    "Use the dedicated context-publication route",
+                    code="context_publication_route_required",
+                ),
+                status=400,
+            )
+        if not required:
+            return None, None
+        if "system_message" in body or "instructions" in body:
+            return None, web.json_response(
+                _openai_error(
+                    "Protected publication cannot add unbound model context",
+                    code="context_publication_unbound_context",
+                ),
+                status=400,
+            )
+        if not supplied:
+            return None, web.json_response(
+                _openai_error(
+                    "publicationAuthorization is required",
+                    code="context_publication_authorization_required",
+                ),
+                status=400,
+            )
+        try:
+            from hermes_cli.context_publication import (
+                ContextPublicationAuthorizationRequest,
+            )
+
+            return (
+                ContextPublicationAuthorizationRequest.from_mapping(
+                    body.get("publicationAuthorization")
+                ),
+                None,
+            )
+        except Exception as exc:
+            from hermes_cli.context_publication import ContextPublicationError
+
+            if isinstance(exc, ContextPublicationError):
+                return None, self._context_publication_error_response(exc)
+            raise
+
+    async def _handle_context_publication_authorize(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Mint bounded authority from metadata-only host policy."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _session, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if set(body) != {"preparation"}:
+            return web.json_response(
+                _openai_error(
+                    "Expected exactly one preparation object",
+                    code="context_publication_request_invalid",
+                ),
+                status=400,
+            )
+        try:
+            from hermes_cli.context_publication import (
+                BrowserPublicationPreparation,
+                HostPublicationBinding,
+                get_context_publication_authorization_service,
+            )
+            from hermes_cli.profiles import get_active_profile_name
+
+            preparation = BrowserPublicationPreparation.from_mapping(
+                body.get("preparation")
+            )
+            db = await self._ensure_session_db_async()
+            resolved_id = await asyncio.to_thread(
+                db.resolve_resume_session_id, session_id
+            )
+            resolved_id = str(resolved_id or session_id)
+            root_id = await asyncio.to_thread(
+                db.get_conversation_root, resolved_id
+            )
+            session_generation = await asyncio.to_thread(
+                db.ensure_context_publication_session_generation, resolved_id
+            )
+            request_profile = _api_request_profile.get()
+            with self._profile_scope(request_profile):
+                service = get_context_publication_authorization_service(db)
+                acceptance = await asyncio.to_thread(
+                    service.authorize,
+                    preparation,
+                    HostPublicationBinding(
+                        profile_name=get_active_profile_name(),
+                        session_root_id=str(root_id or resolved_id),
+                        session_tip_id=resolved_id,
+                        session_generation=session_generation,
+                    ),
+                )
+        except Exception as exc:
+            from hermes_cli.context_publication import ContextPublicationError
+
+            if isinstance(exc, ContextPublicationError):
+                return self._context_publication_error_response(exc)
+            if isinstance(exc, KeyError):
+                return self._context_publication_error_response(
+                    ContextPublicationError("authorization_session_drift")
+                )
+            raise
+        return web.json_response(
+            {
+                "protocol": "hermes.context-publication-authorization.v1",
+                "token": acceptance.token,
+                "expiresAt": int(acceptance.expires_at * 1000),
+            },
+            status=201,
+        )
+
+    async def _handle_context_publication_chat(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        request[_CONTEXT_PUBLICATION_REQUIRED_KEY] = True
+        try:
+            return await self._handle_session_chat(request)
+        except Exception as exc:
+            from hermes_cli.context_publication import ContextPublicationError
+
+            if isinstance(exc, ContextPublicationError):
+                return self._context_publication_error_response(exc)
+            raise
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -3698,6 +3896,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         user_message, err = _session_chat_user_message(body)
+        if err is not None:
+            return err
+        context_publication_authorization, err = self._context_publication_request(
+            request, body
+        )
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -3766,6 +3969,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            context_publication_authorization=context_publication_authorization,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -3815,6 +4019,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         user_message, err = _session_chat_user_message(body)
+        if err is not None:
+            return err
+        context_publication_authorization, err = self._context_publication_request(
+            request, body
+        )
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -3939,6 +4148,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    context_publication_authorization=context_publication_authorization,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -6293,6 +6503,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        context_publication_authorization: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6373,11 +6584,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    result = agent.run_conversation(
+                    conversation_kwargs = dict(
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
+                    if context_publication_authorization is not None:
+                        conversation_kwargs["context_publication_authorization"] = (
+                            context_publication_authorization
+                        )
+                    result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

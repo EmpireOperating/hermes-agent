@@ -2282,6 +2282,55 @@ class PluginContext:
 
     # -- memory provider registration ---------------------------------------
 
+    def register_context_publication_policy_provider(
+        self, provider
+    ) -> Optional[PluginRegistration]:
+        """Register a generic metadata-only context-publication policy.
+
+        Protected publication is unanimous and fail-closed across every
+        provider in the active profile. The host owns provider generations and
+        unload cleanup; plugins never mint or consume acceptance tokens.
+        """
+        from hermes_cli.context_publication import (
+            ContextPublicationPolicyProvider,
+            get_context_publication_policy_registry,
+        )
+
+        if not isinstance(provider, ContextPublicationPolicyProvider):
+            logger.warning(
+                "Plugin '%s' tried to register a context-publication policy "
+                "that does not inherit from ContextPublicationPolicyProvider. "
+                "Ignoring.",
+                self.manifest.name,
+            )
+            return None
+        registry = get_context_publication_policy_registry()
+        try:
+            registration = registry.register(
+                provider,
+                scope=self._manager.scope_key,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Plugin '%s' failed to register context-publication policy "
+                "%r: %s",
+                self.manifest.name,
+                getattr(provider, "name", "?"),
+                exc,
+            )
+            return None
+        handle = self._track(
+            "context_publication_policy_provider",
+            provider.name,
+            registration.dispose,
+        )
+        logger.info(
+            "Plugin '%s' registered context-publication policy: %s",
+            self.manifest.name,
+            provider.name,
+        )
+        return handle
+
     def register_memory_provider(self, provider) -> None:
         """Register a memory provider.
 
@@ -2421,6 +2470,40 @@ class PluginContext:
             self.manifest.name, registry_name, provider.display_name,
         )
         return handle
+
+    def register_dashboard_token_route(
+        self,
+        path: str,
+        *,
+        provider: str,
+        required_scopes=(),
+    ) -> PluginRegistration:
+        """Register a profile-scoped machine-auth route with unload cleanup.
+
+        The provider must be registered separately through
+        :meth:`register_dashboard_auth_provider`; callers should stop if that
+        registration returns ``None``. Conflicting live route policies are
+        retained as a fail-closed poison until one owner unloads.
+        """
+        from hermes_cli.dashboard_auth.token_auth import register_token_route
+
+        registration = register_token_route(
+            path,
+            provider=provider,
+            required_scopes=required_scopes,
+            scope=self._manager.scope_key,
+        )
+        if registration is None:  # Explicit providers always produce a handle.
+            raise RuntimeError("dashboard token route registration was inert")
+        try:
+            return self._track(
+                "dashboard_token_route",
+                path,
+                registration.dispose,
+            )
+        except Exception:
+            registration.dispose()
+            raise
 
     # -- video gen provider registration -------------------------------------
 

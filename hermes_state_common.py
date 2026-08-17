@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -313,6 +313,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL,
+    context_publication_generation TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -396,6 +397,26 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS context_publication_acceptances (
+    token_hash TEXT PRIMARY KEY,
+    profile_name TEXT NOT NULL,
+    process_id TEXT NOT NULL,
+    session_root_id TEXT NOT NULL,
+    session_tip_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    session_generation TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    payload_byte_length INTEGER NOT NULL,
+    proposal_sha256 TEXT NOT NULL,
+    provider_generations_json TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at REAL,
+    outcome TEXT NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_publication_pending
+ON context_publication_acceptances(profile_name, process_id, expires_at);
 
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,

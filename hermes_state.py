@@ -25,6 +25,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -10837,6 +10838,178 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         chain = self._session_lineage_root_to_tip(session_id)
         return (chain[0] if chain and chain[0] else session_id)
+
+    def ensure_context_publication_session_generation(self, session_id: str) -> str:
+        """Return an immutable incarnation ID for one live session row."""
+        def _write(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                "SELECT context_publication_generation FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            generation = row[0]
+            if not generation:
+                candidate = secrets.token_urlsafe(18)
+                conn.execute(
+                    "UPDATE sessions SET context_publication_generation=? "
+                    "WHERE id=? AND (context_publication_generation IS NULL "
+                    "OR context_publication_generation='')",
+                    (candidate, session_id),
+                )
+                generation = conn.execute(
+                    "SELECT context_publication_generation FROM sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()[0]
+            return str(generation)
+
+        return self._execute_write(_write)
+
+    def get_context_publication_session_generation(
+        self, session_id: str
+    ) -> Optional[str]:
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT context_publication_generation FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return str(row[0])
+
+    def create_context_publication_acceptance(
+        self,
+        *,
+        token_hash: str,
+        profile_name: str,
+        process_id: str,
+        session_root_id: str,
+        session_tip_id: str,
+        session_generation: str,
+        payload_sha256: str,
+        payload_byte_length: int,
+        proposal_sha256: str,
+        provider_generations_json: str,
+        issued_at: float,
+        expires_at: float,
+        max_pending: int,
+    ) -> None:
+        def _write(conn: sqlite3.Connection) -> None:
+            session = conn.execute(
+                "SELECT context_publication_generation FROM sessions WHERE id=?",
+                (session_tip_id,),
+            ).fetchone()
+            if session is None or session[0] != session_generation:
+                raise ValueError("authorization_session_drift")
+            conn.execute(
+                "DELETE FROM context_publication_acceptances "
+                "WHERE consumed_at IS NOT NULL OR expires_at<=?",
+                (issued_at,),
+            )
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM context_publication_acceptances "
+                "WHERE profile_name=? AND process_id=? "
+                "AND consumed_at IS NULL AND expires_at>?",
+                (profile_name, process_id, issued_at),
+            ).fetchone()[0]
+            if pending >= max_pending:
+                raise ValueError("authorization_capacity")
+            conn.execute(
+                """
+                INSERT INTO context_publication_acceptances (
+                    token_hash, profile_name, process_id,
+                    session_root_id, session_tip_id, session_generation,
+                    payload_sha256, payload_byte_length, proposal_sha256,
+                    provider_generations_json, issued_at, expires_at,
+                    consumed_at, outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending')
+                """,
+                (
+                    token_hash,
+                    profile_name,
+                    process_id,
+                    session_root_id,
+                    session_tip_id,
+                    session_generation,
+                    payload_sha256,
+                    payload_byte_length,
+                    proposal_sha256,
+                    provider_generations_json,
+                    issued_at,
+                    expires_at,
+                ),
+            )
+
+        self._execute_write(_write)
+
+    def consume_context_publication_acceptance(
+        self,
+        *,
+        token_hash: str,
+        profile_name: str,
+        process_id: str,
+        session_root_id: str,
+        session_tip_id: str,
+        session_generation: str,
+        payload_sha256: str,
+        payload_byte_length: int,
+        proposal_sha256: str,
+        provider_generations_json: str,
+        binding_matches: bool,
+        now: float,
+    ) -> str:
+        """Atomically consume or terminally burn one known acceptance."""
+        def _write(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                "SELECT * FROM context_publication_acceptances WHERE token_hash=?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return "authorization_invalid"
+            if row["consumed_at"] is not None:
+                return "authorization_replayed"
+
+            outcome = "consumed"
+            if not now < float(row["expires_at"]):
+                outcome = "authorization_expired"
+            elif row["process_id"] != process_id:
+                outcome = "authorization_process_drift"
+            elif (
+                row["profile_name"] != profile_name
+                or row["session_root_id"] != session_root_id
+                or row["session_tip_id"] != session_tip_id
+                or row["session_generation"] != session_generation
+            ):
+                outcome = "authorization_host_drift"
+            elif not binding_matches:
+                outcome = "authorization_binding_drift"
+            elif (
+                row["payload_sha256"] != payload_sha256
+                or row["payload_byte_length"] != payload_byte_length
+                or row["proposal_sha256"] != proposal_sha256
+            ):
+                outcome = "authorization_binding_drift"
+            elif row["provider_generations_json"] != provider_generations_json:
+                outcome = "authorization_provider_drift"
+            else:
+                session = conn.execute(
+                    "SELECT context_publication_generation FROM sessions WHERE id=?",
+                    (session_tip_id,),
+                ).fetchone()
+                if session is None or session[0] != session_generation:
+                    outcome = "authorization_session_drift"
+
+            cursor = conn.execute(
+                "UPDATE context_publication_acceptances "
+                "SET consumed_at=?, outcome=? "
+                "WHERE token_hash=? AND consumed_at IS NULL",
+                (now, outcome, token_hash),
+            )
+            if cursor.rowcount != 1:
+                return "authorization_replayed"
+            return outcome
+
+        return self._execute_write(_write)
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:

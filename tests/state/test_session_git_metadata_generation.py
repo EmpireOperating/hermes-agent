@@ -213,11 +213,13 @@ def test_generation_authority_is_scoped_to_each_profile_database(tmp_path):
         second.close()
 
 
-def test_legacy_sessions_table_reconciles_generation_column(tmp_path):
+def test_legacy_sessions_table_reconciles_generation_columns_and_acceptances(tmp_path):
     path = tmp_path / "state.db"
     SessionDB(db_path=path).close()
     conn = sqlite3.connect(path)
     try:
+        conn.execute("DROP TABLE context_publication_acceptances")
+        conn.execute("ALTER TABLE sessions DROP COLUMN context_publication_generation")
         conn.execute("ALTER TABLE sessions DROP COLUMN git_metadata_generation")
         conn.execute("UPDATE schema_version SET version = 25")
         conn.commit()
@@ -232,12 +234,25 @@ def test_legacy_sessions_table_reconciles_generation_column(tmp_path):
                 row[1]
                 for row in verify.execute("PRAGMA table_info('sessions')")
             }
+            table_exists = verify.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'context_publication_acceptances'"
+            ).fetchone()
+            foreign_keys = verify.execute(
+                "PRAGMA foreign_key_list('context_publication_acceptances')"
+            ).fetchall()
         finally:
             verify.close()
         assert "git_metadata_generation" in columns
+        assert "context_publication_generation" in columns
+        assert table_exists == (1,)
+        assert any(
+            row[2] == "sessions" and row[6].upper() == "CASCADE"
+            for row in foreign_keys
+        )
         assert reopened._conn.execute(
             "SELECT version FROM schema_version"
-        ).fetchone()[0] == SCHEMA_VERSION == 26
+        ).fetchone()[0] == SCHEMA_VERSION == 27
         reopened.create_session("session", "desktop", cwd="/repo")
         assert reopened.update_session_cwd("session", "/repo") == 1
     finally:

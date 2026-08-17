@@ -10,6 +10,11 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from hermes_cli.context_publication import (
+    ContextPublicationAcceptance,
+    ContextPublicationError,
+    canonicalize_context_publication,
+)
 from hermes_state import SessionDB
 
 
@@ -65,6 +70,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_resources"] is True
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
+    assert features["context_publication_authorization"] is True
     assert features["session_fork"] is True
     assert features["run_steer"] is True
     assert features["admin_config_rw"] is False
@@ -80,6 +86,224 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/v1/runs/{run_id}/steer",
     }
+    assert data["endpoints"]["context_publication_authorize"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/context-publications/authorize",
+    }
+    assert data["endpoints"]["context_publication"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/context-publications",
+    }
+    assert "context_publication_stream" not in data["endpoints"]
+
+
+@pytest.mark.asyncio
+async def test_context_publication_uses_dedicated_authorize_and_publish_routes(
+    adapter, session_db, monkeypatch
+):
+    session_id = session_db.create_session("protected-session", "api_server")
+    preparation = {
+        "protocol": "hermes.browser.context-publication-preparation.v1",
+        "envelopeProtocol": "hermes.browser.context-publication-envelope.v1",
+        "profileEpochId": "profile-epoch-1",
+        "windowId": 7,
+        "tabId": 11,
+        "documentId": "document-1",
+        "navigationId": "navigation-1",
+        "navigationEpochId": "navigation-epoch-1",
+        "origin": "https://mesh.example",
+        "observedAt": 1_000,
+        "payloadSha256": "9d600fa3a8f2862df3071b1420a57abfe562ccde94bd02a20f4a46f4a9806c53",
+        "payloadByteLength": 92,
+        "contentKind": "text",
+        "imageCount": 0,
+    }
+    observed = {}
+
+    class _Service:
+        def authorize(self, parsed, host):
+            observed["authorize"] = (parsed, host)
+            return ContextPublicationAcceptance("acceptance-token-1", 1_015.0)
+
+    async def fake_run(**kwargs):
+        observed["run"] = kwargs
+        return ({"final_response": "ok", "session_id": session_id}, {})
+
+    monkeypatch.setattr(
+        "hermes_cli.context_publication.get_context_publication_authorization_service",
+        lambda _state_db=None: _Service(),
+    )
+    monkeypatch.setattr(adapter, "_run_agent", fake_run)
+
+    app = web.Application()
+    app.router.add_post(
+        "/api/sessions/{session_id}/context-publications/authorize",
+        adapter._handle_context_publication_authorize,
+    )
+    app.router.add_post(
+        "/api/sessions/{session_id}/context-publications",
+        adapter._handle_context_publication_chat,
+    )
+    app.router.add_post(
+        "/api/sessions/{session_id}/chat",
+        adapter._handle_session_chat,
+    )
+    authorization = {
+        "protocol": "hermes.context-publication-authorization.v1",
+        "token": "acceptance-token-1",
+        "preparation": preparation,
+    }
+
+    async with TestClient(TestServer(app)) as cli:
+        authorize = await cli.post(
+            f"/api/sessions/{session_id}/context-publications/authorize",
+            json={"preparation": preparation},
+        )
+        protected = await cli.post(
+            f"/api/sessions/{session_id}/context-publications",
+            json={
+                "message": "private prompt",
+                "publicationAuthorization": authorization,
+            },
+        )
+        ordinary = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={
+                "message": "private prompt",
+                "publicationAuthorization": authorization,
+            },
+        )
+        authorize_status = authorize.status
+        authorize_payload = await authorize.json()
+        protected_status = protected.status
+        ordinary_status = ordinary.status
+        ordinary_payload = await ordinary.json()
+
+    assert authorize_status == 201
+    assert authorize_payload == {
+        "protocol": "hermes.context-publication-authorization.v1",
+        "token": "acceptance-token-1",
+        "expiresAt": 1_015_000,
+    }
+    assert protected_status == 200
+    assert observed["run"]["context_publication_authorization"].token == (
+        "acceptance-token-1"
+    )
+    assert ordinary_status == 400
+    assert ordinary_payload["error"]["code"] == (
+        "context_publication_route_required"
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_publication_authorize_handles_session_deletion_race(
+    adapter, session_db, monkeypatch
+):
+    session_id = session_db.create_session("deleted-during-authorize", "api_server")
+    publication = canonicalize_context_publication("private prompt")
+    preparation = {
+        "protocol": "hermes.browser.context-publication-preparation.v1",
+        "envelopeProtocol": "hermes.browser.context-publication-envelope.v1",
+        "profileEpochId": "profile-epoch-1",
+        "windowId": 7,
+        "tabId": 11,
+        "documentId": "document-1",
+        "navigationId": "navigation-1",
+        "navigationEpochId": "navigation-epoch-1",
+        "origin": "https://mesh.example",
+        "observedAt": 1_000,
+        "payloadSha256": publication.payload_sha256,
+        "payloadByteLength": publication.payload_byte_length,
+        "contentKind": publication.content_kind,
+        "imageCount": publication.image_count,
+    }
+    monkeypatch.setattr(
+        session_db,
+        "ensure_context_publication_session_generation",
+        lambda _session_id: (_ for _ in ()).throw(KeyError(_session_id)),
+    )
+
+    app = web.Application()
+    app.router.add_post(
+        "/api/sessions/{session_id}/context-publications/authorize",
+        adapter._handle_context_publication_authorize,
+    )
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{session_id}/context-publications/authorize",
+            json={"preparation": preparation},
+        )
+        payload = await response.json()
+
+    assert response.status == 409
+    assert payload["error"]["code"] == "authorization_session_drift"
+
+
+@pytest.mark.asyncio
+async def test_context_publication_consumption_failure_is_structured_and_fail_closed(
+    adapter, session_db, monkeypatch
+):
+    session_id = session_db.create_session("protected-failure", "api_server")
+    preparation = {
+        "protocol": "hermes.browser.context-publication-preparation.v1",
+        "envelopeProtocol": "hermes.browser.context-publication-envelope.v1",
+        "profileEpochId": "profile-epoch-1",
+        "windowId": 7,
+        "tabId": 11,
+        "documentId": "document-1",
+        "navigationId": "navigation-1",
+        "navigationEpochId": "navigation-epoch-1",
+        "origin": "https://mesh.example",
+        "observedAt": 1_000_000,
+        "payloadSha256": "9d600fa3a8f2862df3071b1420a57abfe562ccde94bd02a20f4a46f4a9806c53",
+        "payloadByteLength": 92,
+        "contentKind": "text",
+        "imageCount": 0,
+    }
+    authorization = {
+        "protocol": "hermes.context-publication-authorization.v1",
+        "token": "acceptance-token-1",
+        "preparation": preparation,
+    }
+
+    async def reject_run(**kwargs):
+        del kwargs
+        raise ContextPublicationError("authorization_replayed")
+
+    monkeypatch.setattr(adapter, "_run_agent", reject_run)
+    app = web.Application()
+    app.router.add_post(
+        "/api/sessions/{session_id}/context-publications",
+        adapter._handle_context_publication_chat,
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        rejected = await cli.post(
+            f"/api/sessions/{session_id}/context-publications",
+            json={
+                "message": "private prompt",
+                "publicationAuthorization": authorization,
+            },
+        )
+        unbound = await cli.post(
+            f"/api/sessions/{session_id}/context-publications",
+            json={
+                "message": "private prompt",
+                "system_message": "unbound context",
+                "publicationAuthorization": authorization,
+            },
+        )
+        rejected_status = rejected.status
+        rejected_payload = await rejected.json()
+        unbound_status = unbound.status
+        unbound_payload = await unbound.json()
+
+    assert rejected_status == 409
+    assert rejected_payload["error"]["code"] == "authorization_replayed"
+    assert unbound_status == 400
+    assert unbound_payload["error"]["code"] == (
+        "context_publication_unbound_context"
+    )
 
 
 @pytest.mark.asyncio

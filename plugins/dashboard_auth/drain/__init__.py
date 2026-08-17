@@ -270,19 +270,28 @@ def register(ctx) -> None:
         logger.warning("dashboard-auth-drain: %s", LAST_SKIP_REASON)
         return
 
-    ctx.register_dashboard_auth_provider(provider)
+    provider_registration = ctx.register_dashboard_auth_provider(provider)
+    if provider_registration is None:
+        LAST_SKIP_REASON = "Drain authentication provider registration failed; route disabled."
+        logger.warning("dashboard-auth-drain: %s", LAST_SKIP_REASON)
+        return
 
     # Opt the begin/cancel-drain endpoint into the generic token-auth seam so
     # the dashboard's interactive cookie gate doesn't bounce NAS's bearer call.
     try:
-        from hermes_cli.dashboard_auth.token_auth import register_token_route
-
-        register_token_route(DRAIN_ROUTE_PATH)
-    except Exception as exc:  # noqa: BLE001 — seam import must not crash plugin load
+        ctx.register_dashboard_token_route(
+            DRAIN_ROUTE_PATH,
+            provider=provider.name,
+            required_scopes=(scope,),
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed without crashing host
+        provider_registration.dispose()
+        LAST_SKIP_REASON = f"Drain token route registration failed: {exc}"
         logger.warning(
             "dashboard-auth-drain: could not register token route %s: %s",
             DRAIN_ROUTE_PATH, exc,
         )
+        return
 
     logger.info(
         "dashboard-auth-drain: registered drain service-credential provider "
