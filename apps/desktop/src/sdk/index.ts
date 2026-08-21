@@ -34,6 +34,7 @@ import {
   requestGatewayForAgent,
   requestGatewayForProfile
 } from '@/store/gateway'
+import { openHudForProfile } from '@/store/hud'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
@@ -375,6 +376,14 @@ export const host = {
   newChat: (profile?: null | string): void => {
     newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
     window.location.hash = '#/'
+  },
+
+  /** Open the real floating HUD against a profile without changing the main
+   * window's active gateway or route. An optional stored session id resumes
+   * that conversation; without one, an existing same-profile HUD keeps its
+   * live conversation while a newly opened or cross-profile HUD starts fresh. */
+  openHud: (profile?: null | string, storedSessionId?: null | string): void => {
+    openHudForProfile((profile ?? '').trim() || $activeGatewayProfile.get(), storedSessionId ?? null)
   },
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool

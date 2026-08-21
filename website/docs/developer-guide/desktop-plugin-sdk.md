@@ -462,6 +462,7 @@ host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
                                            //   intent: 'in-place' (default) | 'stack' | 'tab' | 'window'
 host.newChat(profile?)                     // fresh chat draft, optionally in another profile
+host.openHud(profile?, sessionId?)         // open/focus floating real chat on a local/legacy profile; main route stays put
 host.onEvent(type, fn)                     // gateway event stream ('*' = all); returns disposer
 host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot
@@ -496,8 +497,12 @@ Profile-shaped plugins get first-class methods too:
 `profiles.list` (each profile + its most recent conversation as
 `last_session`; pass `include_sessions: false` to skip the per-profile DB
 probe) and `profiles.create` (`name`, `description`, `clone_from`,
-`clone_all`, `no_skills`, `soul`, optional `model` + `provider` pin) — the
-ws twins of the dashboard's `/api/profiles` REST routes.
+`clone_all`, `no_skills`, `soul`, optional `model` + `provider` pin,
+`mirror_credentials`, and `share_auth`) — the ws twins of the dashboard's
+`/api/profiles` REST routes. When `mirror_credentials: false`, the backend
+removes the fresh comment-only `.env` template and returns
+`mirrored.env_absent`; security-sensitive callers should require it to be
+`true` before authorizing the new profile.
 `host.state.busy` is the focused chat's live turn (thinking and streaming).
 `host.state.awaitingResponse` stays true from send until the first assistant
 payload. Both follow the chat the user is actually looking at — the focused

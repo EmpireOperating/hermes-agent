@@ -1,5 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { __resetBackendSkinSync, ingestBackendSkin } from './backend-sync'
 import { ThemeProvider } from './context'
@@ -20,6 +22,38 @@ describe('ThemeProvider ← backend skin sync', () => {
   })
 
   afterEach(cleanup)
+
+  it('does not let the HUD replace the main window boot profile', () => {
+    const setNativeTheme = vi.fn()
+
+    const setTitleBarTheme = vi.fn()
+    const desktopWindow = window as unknown as { hermesDesktop: unknown }
+
+    desktopWindow.hermesDesktop = {
+      setNativeTheme,
+      setTitleBarTheme,
+    }
+    window.localStorage.setItem('hermes-desktop-active-profile-v1', 'default')
+    window.localStorage.setItem('hermes-boot-background', '#operator')
+    window.localStorage.setItem('hermes-boot-color-scheme', 'light')
+    window.history.replaceState({}, '', '/?win=hud&profile=care-acme')
+    $activeGatewayProfile.set('care-acme')
+
+    render(
+      <ThemeProvider>
+        <div />
+      </ThemeProvider>
+    )
+
+    expect(window.localStorage.getItem('hermes-desktop-active-profile-v1')).toBe('default')
+    expect(window.localStorage.getItem('hermes-boot-background')).toBe('#operator')
+    expect(window.localStorage.getItem('hermes-boot-color-scheme')).toBe('light')
+    expect(setNativeTheme).not.toHaveBeenCalled()
+    expect(setTitleBarTheme).not.toHaveBeenCalled()
+    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+    window.history.replaceState({}, '', '/')
+    $activeGatewayProfile.set('default')
+  })
 
   it('applies an activated backend skin', () => {
     render(

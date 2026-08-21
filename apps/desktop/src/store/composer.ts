@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import { deriveDraftTitle } from '@/lib/draft-title'
 import { triggerHaptic } from '@/lib/haptics'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
 export interface ComposerAttachment {
   id: string
@@ -175,6 +176,9 @@ export const mainComposerScope = createComposerAttachmentScope($composerAttachme
 export const SESSION_DRAFTS_STORAGE_KEY = 'hermes:composer-drafts:v3'
 
 const NEW_SESSION_DRAFT_KEY = '__new__'
+export const newSessionDraftScope = (profile: string | null | undefined) =>
+  `${NEW_SESSION_DRAFT_KEY}:${normalizeProfileKey(profile)}`
+const newSessionDraftKey = () => newSessionDraftScope($activeGatewayProfile.get())
 const MAX_PERSISTED_DRAFTS = 50
 const EMPTY_SESSION_DRAFT: SessionDraft = { attachments: [], text: '' }
 
@@ -183,7 +187,7 @@ export interface SessionDraft {
   text: string
 }
 
-const draftKey = (scope: string | null | undefined) => scope?.trim() || NEW_SESSION_DRAFT_KEY
+const draftKey = (scope: string | null | undefined) => scope?.trim() || newSessionDraftKey()
 
 const cloneDraft = (draft: SessionDraft): SessionDraft => ({
   attachments: draft.attachments.map(attachment => ({ ...attachment })),
@@ -208,6 +212,31 @@ function loadPersistedDraftTexts(): [string, SessionDraft][] {
 }
 
 const draftsBySession = new Map<string, SessionDraft>(loadPersistedDraftTexts())
+
+export function migrateLegacyNewSessionDraft(drafts: Map<string, SessionDraft>): boolean {
+  const legacy = drafts.get(NEW_SESSION_DRAFT_KEY)
+
+  if (!legacy) {
+    return false
+  }
+
+  const defaultKey = `${NEW_SESSION_DRAFT_KEY}:default`
+
+  if (!drafts.has(defaultKey)) {
+    drafts.set(defaultKey, legacy)
+  }
+
+  drafts.delete(NEW_SESSION_DRAFT_KEY)
+
+  return true
+}
+
+// v3 stored every fresh-chat draft under one global key. Migrate that legacy
+// value to the default profile only; assigning it to whichever auxiliary HUD
+// happens to import first could disclose one profile's unsent text to another.
+if (migrateLegacyNewSessionDraft(draftsBySession)) {
+  persistDraftTexts()
+}
 
 /**
  * Patch one asynchronous attachment occurrence wherever the main composer owns

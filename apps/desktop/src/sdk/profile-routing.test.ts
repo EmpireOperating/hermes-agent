@@ -15,6 +15,7 @@ vi.mock('@/components/pane-shell/tree/store', async () => {
 })
 vi.mock('@/contrib/events', () => ({ onGatewayEvent: vi.fn() }))
 vi.mock('@/hermes', () => ({ deleteProfile: vi.fn(), getLogs: vi.fn(), getStatus: vi.fn() }))
+vi.mock('@/store/hud', () => ({ openHudForProfile: vi.fn() }))
 vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn() }))
 vi.mock('@/store/system-actions', () => ({ runGatewayRestart: vi.fn() }))
 vi.mock('@/store/session', async () => {
@@ -93,6 +94,7 @@ vi.mock('@/store/gateway', async () => {
 
 const { host } = await import('./index')
 const { requestGatewayForAgent, requestGatewayForProfile } = await import('@/store/gateway')
+const { openHudForProfile } = await import('@/store/hud')
 const { $profiles, refreshProfiles } = await import('@/store/profile')
 
 const profile = (name: string): ProfileInfo => ({
@@ -112,6 +114,12 @@ afterEach(() => {
 })
 
 describe('connection-aware plugin host APIs', () => {
+  it('opens HUD against an explicit profile without activating it in the main window', () => {
+    host.openHud('care-acme-dental')
+
+    expect(openHudForProfile).toHaveBeenCalledWith('care-acme-dental', null)
+  })
+
   it('refreshes the profile inventory before asking Electron for routes', async () => {
     const getProfileRoutes = vi.fn(async () => [
       { connectionId: 'connection-local', mode: 'local', profile: 'desktop-primary', targetProfile: 'desktop-primary' },

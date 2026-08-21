@@ -17,6 +17,7 @@ from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
 method = _registry.method
+profile_mutation_locked = _registry.profile_mutation_locked
 
 
 @method("profiles.list")
@@ -141,9 +142,14 @@ def _(rid, params: dict) -> dict:
                 if meta_path.is_file():
                     with open(meta_path, "r", encoding="utf-8") as f:
                         raw_meta = _yaml.safe_load(f) or {}
-                    ui_meta = raw_meta.get("ui_meta")
-                    if isinstance(ui_meta, dict) and ui_meta:
-                        row["ui_meta"] = ui_meta
+                    if isinstance(raw_meta, dict):
+                        instance_id = raw_meta.get("instance_id")
+                        if isinstance(instance_id, str) and len(instance_id) == 32 \
+                            and all(char in "0123456789abcdef" for char in instance_id):
+                            row["instance_id"] = instance_id
+                        ui_meta = raw_meta.get("ui_meta")
+                        if isinstance(ui_meta, dict) and ui_meta:
+                            row["ui_meta"] = ui_meta
             except Exception:
                 pass
 
@@ -170,6 +176,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("profiles.create")
+@profile_mutation_locked
 def _(rid, params: dict) -> dict:
     """Create a profile — the ws twin of POST /api/profiles.
 
@@ -211,14 +218,19 @@ def _(rid, params: dict) -> dict:
 
         clone_from = str(params.get("clone_from") or "").strip() or None
         clone_all = is_truthy_value(params.get("clone_all", False))
-        path = profiles_mod.create_profile(
+        created = profiles_mod.create_profile(
             name=name,
             clone_from=clone_from,
             clone_all=clone_all,
             clone_config=bool(clone_from) and not clone_all,
             no_skills=is_truthy_value(params.get("no_skills", False)),
             description=str(params.get("description") or "").strip() or None,
+            return_instance=True,
         )
+        if not isinstance(created, tuple):
+            raise RuntimeError("profile instance identity unavailable")
+        path, instance_id = created
+        instance_written = True
     except (ValueError, FileExistsError, FileNotFoundError) as e:
         return _err(rid, 4062, str(e))
     except Exception as e:
@@ -260,11 +272,31 @@ def _(rid, params: dict) -> dict:
     # for single-use refresh tokens. Sharing keeps one live token pool
     # for the main profile and every bot. Static .env keys still copy
     # (no refresh semantics, so copying is safe).
-    mirrored = {"env": False, "auth": False, "model_inherited": False, "voice": False}
+    mirrored = {
+        "env": False,
+        "env_absent": False,
+        "auth": False,
+        "auth_verified": False,
+        "model_inherited": False,
+        "voice": False,
+    }
     share_auth = is_truthy_value(params.get("share_auth", False))
+    mirror_credentials = is_truthy_value(params.get("mirror_credentials", True))
     if share_auth:
         mirrored["auth"] = "shared"
-    if is_truthy_value(params.get("mirror_credentials", True)):
+    if not mirror_credentials:
+        # create_profile() seeds a comment-only .env template. Credential-free
+        # callers require the stronger filesystem guarantee that no per-profile
+        # credential file exists at all; remove only that known-empty template,
+        # never a clone-provided file with real content.
+        dst_env = path / ".env"
+        try:
+            if dst_env.is_file() and not _has_real_env_content(dst_env):
+                dst_env.unlink()
+        except OSError:
+            pass
+        mirrored["env_absent"] = not dst_env.exists()
+    if mirror_credentials:
         import shutil
 
         from hermes_constants import get_hermes_home
@@ -298,6 +330,29 @@ def _(rid, params: dict) -> dict:
     model = str(params.get("model") or "").strip()
     provider = str(params.get("provider") or "").strip()
     model_set = False
+
+    if share_auth and provider:
+        try:
+            from hermes_cli.auth import read_credential_pool
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            token = set_hermes_home_override(str(path))
+            try:
+                credentials = read_credential_pool(provider)
+            finally:
+                reset_hermes_home_override(token)
+
+            def _usable_shared_credential(entry) -> bool:
+                if not isinstance(entry, dict) or entry.get("last_status") == "dead":
+                    return False
+                values = (entry.get("access_token"), entry.get("refresh_token"))
+                return any(isinstance(value, str) and bool(value.strip()) for value in values)
+
+            mirrored["auth_verified"] = any(
+                _usable_shared_credential(entry) for entry in credentials
+            )
+        except Exception:
+            mirrored["auth_verified"] = False
 
     def _mirror_voice_sections() -> bool:
         """Copy voice config (stt/tts/voice) from the launch profile.
@@ -351,7 +406,7 @@ def _(rid, params: dict) -> dict:
         except Exception:
             return False
 
-    if is_truthy_value(params.get("mirror_credentials", True)):
+    if mirror_credentials:
         mirrored["voice"] = _mirror_voice_sections()
 
     if model and provider:
@@ -362,7 +417,7 @@ def _(rid, params: dict) -> dict:
             model_set = True
         except Exception:
             pass
-    elif is_truthy_value(params.get("mirror_credentials", True)):
+    elif mirror_credentials:
         # No explicit pin: inherit the launch profile's provider+model so the
         # first turn resolves. Gate on the MODEL SECTION being absent, not on
         # config.yaml existing — earlier mirroring steps (voice sections,
@@ -401,6 +456,8 @@ def _(rid, params: dict) -> dict:
             "ok": True,
             "name": name,
             "path": str(path),
+            "instance_id": instance_id,
+            "instance_written": instance_written,
             "soul_written": soul_written,
             "model_set": model_set,
             "mirrored": mirrored,
@@ -580,6 +637,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("profiles.configure")
+@profile_mutation_locked
 def _(rid, params: dict) -> dict:
     """Apply configuration changes to a profile (editor Save).
 
@@ -616,39 +674,53 @@ def _(rid, params: dict) -> dict:
             # assets elsewhere and store a reference.
             try:
                 import json as _json
+                import yaml as _yaml
+
+                from hermes_cli.profiles import profile_mutation_lock
+                from utils import atomic_yaml_write
 
                 incoming = params["ui_meta"]
                 if len(_json.dumps(incoming)) > 65536:
                     applied["ui_meta"] = False
                 else:
-                    import yaml as _yaml
-
-                    meta_path = profile_dir / "profile.yaml"
-                    existing = {}
-                    if meta_path.is_file():
-                        try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                loaded = _yaml.safe_load(f) or {}
-                            if isinstance(loaded, dict):
-                                existing = loaded
-                        except Exception:
-                            existing = {}
-                    current = existing.get("ui_meta")
-                    if not isinstance(current, dict):
-                        current = {}
-                    for key, value in incoming.items():
-                        if value is None:
-                            current.pop(key, None)
+                    with profile_mutation_lock(name):
+                        locked_profile_dir = Path(get_profile_dir(name))
+                        if not locked_profile_dir.is_dir():
+                            applied["ui_meta"] = False
                         else:
-                            current[key] = value
-                    if current:
-                        existing["ui_meta"] = current
-                    else:
-                        existing.pop("ui_meta", None)
-                    from utils import atomic_yaml_write
-
-                    atomic_yaml_write(meta_path, existing, sort_keys=False)
-                    applied["ui_meta"] = True
+                            meta_path = locked_profile_dir / "profile.yaml"
+                            existing = {}
+                            if meta_path.is_file():
+                                try:
+                                    with open(meta_path, "r", encoding="utf-8") as f:
+                                        loaded = _yaml.safe_load(f) or {}
+                                    if isinstance(loaded, dict):
+                                        existing = loaded
+                                except Exception:
+                                    existing = {}
+                            expected_instance_id = params.get("expected_instance_id")
+                            if expected_instance_id is not None and (
+                                not isinstance(expected_instance_id, str)
+                                or len(expected_instance_id) != 32
+                                or any(char not in "0123456789abcdef" for char in expected_instance_id)
+                                or existing.get("instance_id") != expected_instance_id
+                            ):
+                                applied["ui_meta"] = False
+                            else:
+                                current = existing.get("ui_meta")
+                                if not isinstance(current, dict):
+                                    current = {}
+                                for key, value in incoming.items():
+                                    if value is None:
+                                        current.pop(key, None)
+                                    else:
+                                        current[key] = value
+                                if current:
+                                    existing["ui_meta"] = current
+                                else:
+                                    existing.pop("ui_meta", None)
+                                atomic_yaml_write(meta_path, existing, sort_keys=False)
+                                applied["ui_meta"] = True
             except Exception:
                 applied["ui_meta"] = False
 

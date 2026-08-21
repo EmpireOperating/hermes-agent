@@ -91,6 +91,7 @@ declare global {
       // owns the window; `onChanged` keeps every window's toggle truthful.
       hud?: {
         open: (request?: { sessionId?: null | string; profile?: null | string }) => Promise<{ ok: boolean }>
+        getState: () => Promise<{ open: boolean; profile: null | string; sessionId: null | string }>
         close: () => Promise<{ ok: boolean }>
         setIgnoreMouse: (ignore: boolean) => void
         moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
@@ -98,7 +99,14 @@ declare global {
         setVibrancy: (on: boolean) => Promise<{ ok: boolean }>
         setSession: (sessionId: null | string) => void
         onGoto: (callback: (sessionId: string) => void) => () => void
-        onChanged: (callback: (state: { open: boolean; sessionId: null | string }) => void) => () => void
+        onChanged: (
+          callback: (state: {
+            handoff?: boolean
+            open: boolean
+            profile: null | string
+            sessionId: null | string
+          }) => void
+        ) => () => void
         onCursor: (callback: (point: { x: number; y: number } | null) => void) => () => void
       }
       // Quick Entry: a global-hotkey mini composer window. Main owns the OS

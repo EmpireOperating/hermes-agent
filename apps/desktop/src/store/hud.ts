@@ -39,11 +39,15 @@ export const $hudMode = atom(isHudWindow())
  *  toggle tell "switch the HUD to this tab" apart from "dismiss the HUD". */
 export const $hudSession = atom<null | string>(null)
 
+/** Profile the current HUD renderer was opened against. Main needs this to
+ * distinguish "focus the existing profile HUD" from a cross-profile respawn. */
+export const $hudProfile = atom<null | string>(null)
+
 /** True when the shell exposes HUD mode (desktop only). */
 export const canUseHud = (): boolean =>
   typeof window !== 'undefined' && typeof window.hermesDesktop?.hud?.open === 'function'
 
-export function openHud(sessionId?: null | string): void {
+function openHudTarget(profile: string, sessionId?: null | string): void {
   const api = window.hermesDesktop?.hud
 
   if (!api) {
@@ -55,6 +59,26 @@ export function openHud(sessionId?: null | string): void {
   // a cross-window storage event that lands after it has already painted.
   requestComposerDraftSync('flush')
 
+  const preserveLiveSession = $hudActive.get() && $hudProfile.get() === profile && sessionId == null
+
+  $hudActive.set(true)
+  $hudProfile.set(profile)
+
+  if (!preserveLiveSession) {
+    $hudSession.set(sessionId ?? null)
+  }
+
+  void api.open({ sessionId: sessionId ?? null, profile })
+}
+
+/** Open or focus HUD on a specific profile without changing the main window's active
+ * gateway or route. Plugin workspaces use this to keep their control surface
+ * visible while the floating chat boots against client context. */
+export function openHudForProfile(profile: string, sessionId?: null | string): void {
+  openHudTarget(normalizeProfileKey(profile), sessionId)
+}
+
+export function openHud(sessionId?: null | string): void {
   // Which backend the HUD must boot against. The HUD is a full renderer that
   // adopts the PRIMARY backend's profile by default, so handing it a session
   // from a non-primary profile without saying so resolves the id against the
@@ -66,9 +90,7 @@ export function openHud(sessionId?: null | string): void {
     rememberedSessionProfile($sessions.get(), sessionId ?? null, $activeGatewayProfile.get())
   )
 
-  $hudActive.set(true)
-  $hudSession.set(sessionId ?? null)
-  void api.open({ sessionId: sessionId ?? null, profile })
+  openHudTarget(profile, sessionId)
 }
 
 /** Leave HUD mode. Callable from either window — main closes the child, the
@@ -81,6 +103,7 @@ export function closeHud(): void {
   }
 
   $hudActive.set(false)
+  $hudProfile.set(null)
   $hudSession.set(null)
   void api.close()
 }
@@ -98,15 +121,62 @@ export const reportHudSession = (sessionId: null | string): void => window.herme
  * app window the session the HUD ended on. Returns a disposer; no-ops outside
  * Electron.
  */
-export function watchHudState(onClosed?: (sessionId: null | string) => void): () => void {
-  const off = window.hermesDesktop?.hud?.onChanged?.(({ open, sessionId }) => {
-    $hudActive.set(open)
-    $hudSession.set(open ? sessionId : null)
+export interface HudClosedTarget {
+  isCurrent: () => boolean
+  profile: string
+  sessionId: null | string
+}
 
-    if (!open) {
-      onClosed?.(sessionId)
+export function watchHudState(onClosed?: (target: HudClosedTarget) => void): () => void {
+  const api = window.hermesDesktop?.hud
+
+  if (!api) {
+    return () => {}
+  }
+
+  let revision = 0
+  let disposed = false
+
+  const adopt = (
+    { handoff = false, open, profile, sessionId }: {
+      handoff?: boolean
+      open: boolean
+      profile: null | string
+      sessionId: null | string
+    },
+    emitClosed = false,
+  ) => {
+    const authoritativeProfile = normalizeProfileKey(profile)
+
+    if (!open && emitClosed && handoff) {
+      const closedRevision = revision
+      onClosed?.({
+        isCurrent: () => !disposed && revision === closedRevision && !$hudActive.get(),
+        profile: authoritativeProfile,
+        sessionId,
+      })
     }
+
+    $hudActive.set(open)
+    $hudProfile.set(open ? authoritativeProfile : null)
+    $hudSession.set(open ? sessionId : null)
+  }
+
+  const off = api.onChanged?.(state => {
+    revision += 1
+    adopt(state, true)
   })
 
-  return off ?? (() => {})
+  const snapshotRevision = revision
+
+  void api.getState?.().then(state => {
+    if (!disposed && revision === snapshotRevision) {
+      adopt(state)
+    }
+  }).catch(() => undefined)
+
+  return () => {
+    disposed = true
+    off?.()
+  }
 }

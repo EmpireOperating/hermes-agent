@@ -198,6 +198,7 @@ import {
 import { cursorPointInWindow } from './hud-cursor'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
+import { hudStatePayload } from './hud-state-routing'
 import { buildHudWindowUrl } from './hud-url'
 import { imageContextMenuItems } from './image-context-menu'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
@@ -10946,6 +10947,10 @@ let hudSessionId = null
 // must be respawned against the new profile's backend (see openHudWindow).
 let hudProfile = null
 
+// Cross-profile respawns and explicit closes must suppress only the HUD handoff
+// side effect while preserving every other `closed` listener's cleanup.
+const suppressedHudCloseHandoffs = new WeakSet()
+
 // A wide, short bar parked near the bottom of the active display — the shape
 // of a game chat frame, and where one belongs. Defaults only: once the user
 // moves or resizes the HUD, hud-state.json wins (same pattern as the main
@@ -11138,11 +11143,12 @@ function hudUrl(sessionId, profile) {
 // Carries the HUD's session so the app window can re-home onto it on the way
 // out (see hudSessionId).
 function broadcastHudState(open) {
-  const payload = { open, sessionId: hudSessionId }
-
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
-      win.webContents.send('hermes:hud:changed', payload)
+      win.webContents.send(
+        'hermes:hud:changed',
+        hudStatePayload(open, hudProfile, hudSessionId, win === mainWindow)
+      )
     }
   }
 }
@@ -11239,6 +11245,10 @@ function spawnHudWindow(sessionId, profile) {
     // this is safe even if closeHudWindow() already released it.
     hudSnapShortcut.dispose()
 
+    if (suppressedHudCloseHandoffs.delete(win)) {
+      return
+    }
+
     // Put the app back so the user is never left with no surface, and
     // correct every window's toggle.
     restoreMainWindowFromHud()
@@ -11278,7 +11288,7 @@ function openHudWindow(sessionId, profile) {
     if (profileKey && hudProfile !== profileKey) {
       const win = hudWindow
       hudWindow = null
-      win.removeAllListeners('closed')
+      suppressedHudCloseHandoffs.add(win)
       win.destroy()
 
       hudSessionId = sessionId || null
@@ -11296,11 +11306,12 @@ function openHudWindow(sessionId, profile) {
     if (sessionId && sessionId !== hudSessionId) {
       hudSessionId = sessionId
       hudWindow.webContents.send('hermes:hud:goto', sessionId)
-      // Keep every window's idea of where the HUD is pointed in step, so the
-      // toggle keeps reading "switch" vs "dismiss" correctly.
-      broadcastHudState(true)
+      // The unconditional replay below updates every renderer after retargeting.
     }
 
+    // Replay the authoritative tuple even for a plain focus so renderers
+    // created after the original open cannot remain stale.
+    broadcastHudState(true)
     focusWindow(hudWindow)
 
     return hudWindow
@@ -11323,8 +11334,8 @@ function closeHudWindow() {
   hudWindow = null
 
   if (win && !win.isDestroyed()) {
-    // Null'd first so the 'closed' handler doesn't broadcast a second time.
-    win.removeAllListeners('closed')
+    // Preserve cleanup listeners while suppressing the duplicate handoff/broadcast.
+    suppressedHudCloseHandoffs.add(win)
     win.close()
   }
 
@@ -12073,6 +12084,12 @@ ipcMain.handle('hermes:hud:open', async (_event, request) => {
   return { ok: true }
 })
 
+ipcMain.handle('hermes:hud:get-state', async () => ({
+  open: Boolean(hudWindow && !hudWindow.isDestroyed()),
+  profile: hudProfile,
+  sessionId: hudSessionId
+}))
+
 // Real frosted glass behind the band — the thing CSS backdrop-filter cannot do,
 // because Chromium composites a transparent window's page against nothing and
 // the desktop is not in its backdrop root. Vibrancy IS the window's content
@@ -12158,6 +12175,7 @@ ipcMain.on('hermes:hud:set-bounds', (event, bounds) => {
 ipcMain.on('hermes:hud:session', (event, sessionId) => {
   if (hudWindow && !hudWindow.isDestroyed() && event.sender === hudWindow.webContents) {
     hudSessionId = typeof sessionId === 'string' && sessionId ? sessionId : null
+    broadcastHudState(true)
   }
 })
 

@@ -77,6 +77,9 @@ const APPEARANCE_KEYS = new Set([SKIN_KEY, PROFILE_SKINS_KEY, MODE_KEY, PROFILE_
 const readBootProfileKey = () => normalizeProfileKey(storedString(LAST_PROFILE_KEY))
 const rememberActiveProfileKey = (profile: string) => persistString(LAST_PROFILE_KEY, profile)
 
+const isHudRenderer = () => typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).get('win') === 'hud'
+
 // ─── Color math (for synthesised light variants of dark-only skins) ────────
 // hexToRgb / mix / readableOn live in ./color so the VS Code converter shares
 // the exact same math.
@@ -176,7 +179,7 @@ const mixesFor = (isDark: boolean): Record<string, string> => ({
   '--theme-mix-bubble': isDark ? '46%' : '0%'
 })
 
-function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
+function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark', publishShared = true) {
   if (typeof document === 'undefined') {
     return
   }
@@ -235,20 +238,22 @@ function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
 
   const chromeBg = chromeBackground(c.background, isDark)
 
-  window.hermesDesktop?.setTitleBarTheme?.({
-    background: chromeBg,
-    foreground: c.foreground
-  })
+  if (publishShared) {
+    window.hermesDesktop?.setTitleBarTheme?.({
+      background: chromeBg,
+      foreground: c.foreground
+    })
 
-  // Raw (non-JSON) keys read by the inline pre-paint script in index.html —
-  // they let a brand-new window paint the themed background on its very first
-  // frame, before this module has even loaded.
-  try {
-    window.localStorage.setItem('hermes-boot-background', chromeBg)
-    window.localStorage.setItem('hermes-boot-color-scheme', rendered)
-  } catch {
-    // Storage may be unavailable (private mode / quota); the inline script
-    // falls back to prefers-color-scheme.
+    // Raw (non-JSON) keys read by the inline pre-paint script in index.html —
+    // they let a brand-new window paint the themed background on its very first
+    // frame, before this module has even loaded.
+    try {
+      window.localStorage.setItem('hermes-boot-background', chromeBg)
+      window.localStorage.setItem('hermes-boot-color-scheme', rendered)
+    } catch {
+      // Storage may be unavailable (private mode / quota); the inline script
+      // falls back to prefers-color-scheme.
+    }
   }
 
   if (typo.fontUrl && !INJECTED_FONT_URLS.has(typo.fontUrl)) {
@@ -276,8 +281,13 @@ if (typeof window !== 'undefined') {
   const pref = modePref.resolve(profile)
   const resolved = resolveMode(pref)
   const theme = deriveTheme(skinPref.resolve(profile), resolved)
-  applyTheme(theme, resolved)
-  syncNativeTheme(pref, renderedModeFor(theme.colors, resolved))
+  const publishShared = !isHudRenderer()
+
+  applyTheme(theme, resolved, publishShared)
+
+  if (publishShared) {
+    syncNativeTheme(pref, renderedModeFor(theme.colors, resolved))
+  }
 }
 
 // ─── Context ────────────────────────────────────────────────────────────────
@@ -349,7 +359,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // Follow profile switches: paint the profile's assigned skin + mode and
   // remember it for the next boot's first paint.
   useEffect(() => {
-    rememberActiveProfileKey(profileKey)
+    if (!isHudRenderer()) {
+      rememberActiveProfileKey(profileKey)
+    }
+
     setThemeNameState(skinPref.resolve(profileKey))
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
@@ -390,11 +403,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // What actually gets painted (matches the `.dark` class applyTheme toggles).
   const renderedMode = useMemo(() => renderedModeFor(activeTheme.colors, resolvedMode), [activeTheme, resolvedMode])
 
-  useEffect(() => applyTheme(activeTheme, resolvedMode), [activeTheme, resolvedMode])
+  useEffect(
+    () => applyTheme(activeTheme, resolvedMode, !isHudRenderer()),
+    [activeTheme, resolvedMode]
+  )
 
   // Keep the native window appearance pinned to the app theme (vibrancy
   // material, titlebar, new-window pre-paint background).
-  useEffect(() => syncNativeTheme(mode, renderedMode), [mode, renderedMode])
+  useEffect(() => {
+    if (!isHudRenderer()) {
+      syncNativeTheme(mode, renderedMode)
+    }
+  }, [mode, renderedMode])
 
   // Assign to whichever profile is live right now (read fresh so the callbacks
   // stay stable across profile switches).

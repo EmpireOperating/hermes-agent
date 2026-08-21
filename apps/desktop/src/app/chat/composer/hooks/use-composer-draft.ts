@@ -7,6 +7,7 @@ import '@/store/suggestion-providers/mcp'
 import '@/store/suggestion-providers/skill'
 
 import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
@@ -14,6 +15,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import {
   type ComposerAttachment,
   type ComposerDraftSyncMode,
+  newSessionDraftScope,
   onComposerDraftSyncRequest,
   reloadPersistedDrafts,
   stashSessionDraft,
@@ -21,6 +23,7 @@ import {
 } from '@/store/composer'
 import { isBrowsingHistory } from '@/store/composer-input-history'
 import { clearDraftSuggestions, sampleComposerDraft } from '@/store/composer-suggestions'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import {
   cloneAttachments,
@@ -77,6 +80,8 @@ export function useComposerDraft({
   const composerRuntime = useComposerRuntime()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
+  const activeProfile = useStore($activeGatewayProfile)
+  const draftSessionScope = activeQueueSessionKey ?? newSessionDraftScope(activeProfile)
 
   // Coarse edges only — these flip rarely (empty↔non-empty, the `?` help sigil,
   // steerable-vs-slash), so typing within a line costs no render.
@@ -228,8 +233,11 @@ export function useComposerDraft({
     }
   }, [appendExternalText, inputDisabled, paintDraft, target])
 
-  const stashAt = (scope: string | null, text = draftRef.current, attachments = attachmentScope.$attachments.get()) =>
-    stashSessionDraft(scope, text, attachments)
+  const stashAt = useCallback(
+    (scope: string | null, text = draftRef.current, attachments = attachmentScope.$attachments.get()) =>
+      stashSessionDraft(scope, text, attachments),
+    [attachmentScope],
+  )
 
   const loadIntoComposer = (text: string, attachments: ComposerAttachment[]) => {
     // Diagnostic breadcrumb for #59305-class reports: identifies WHAT kind of
@@ -340,7 +348,7 @@ export function useComposerDraft({
       unsubscribe()
       window.clearTimeout(draftPersistTimerRef.current)
     }
-  }, [composerRuntime, queueEditRef])
+  }, [composerRuntime, queueEditRef, stashAt])
 
   const insertText = (text: string) => {
     const base = draftRef.current
@@ -404,9 +412,9 @@ export function useComposerDraft({
     // fire later would just clobber with an older snapshot.
     window.clearTimeout(draftPersistTimerRef.current)
     pendingDraftPersistRef.current = null
-    draftScopeRef.current = activeQueueSessionKey
+    draftScopeRef.current = draftSessionScope
 
-    const { attachments, text } = takeSessionDraft(activeQueueSessionKey)
+    const { attachments, text } = takeSessionDraft(draftSessionScope)
     loadIntoComposer(text, attachments)
 
     return () => {
@@ -414,9 +422,9 @@ export function useComposerDraft({
       const editing = queueEditStateRef.current
 
       if (editing?.sessionKey === activeQueueSessionKey) {
-        stashAt(activeQueueSessionKey, editing.draft, editing.attachments)
+        stashAt(draftSessionScope, editing.draft, editing.attachments)
       } else if (!isBrowsingHistory(sessionId)) {
-        stashAt(activeQueueSessionKey, latestText)
+        stashAt(draftSessionScope, latestText)
       }
 
       // Withdraw the outgoing session's draft suggestions (and any pending
@@ -425,7 +433,7 @@ export function useComposerDraft({
       // lingers in the map and re-appears stale on the way back.
       clearDraftSuggestions(sessionIdRef.current)
     }
-  }, [activeQueueSessionKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [draftSessionScope]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // The HUD handoff's two verbs. Entering HUD mode flushes this editor's text
   // into the shared stash so the HUD's composer boots with it; leaving repaints
@@ -482,7 +490,7 @@ export function useComposerDraft({
       window.removeEventListener('pagehide', flushPendingDraftPersist)
       flushPendingDraftPersist()
     }
-  }, [syncDraftFromEditor])
+  }, [stashAt, syncDraftFromEditor])
 
   return {
     activeQueueSessionKeyRef,

@@ -8,6 +8,7 @@ import {
   type ComposerAttachment,
   createComposerAttachmentOccurrenceId,
   createComposerAttachmentScope,
+  migrateLegacyNewSessionDraft,
   migrateSessionDraft,
   removeComposerAttachment,
   requestVoiceConversationStart,
@@ -17,6 +18,7 @@ import {
   takeVoiceConversationStart,
   updateComposerAttachment
 } from './composer'
+import { $activeGatewayProfile } from './profile'
 
 describe('voice conversation start requests', () => {
   it('latches each request until the main composer consumes it once', () => {
@@ -231,6 +233,33 @@ describe('session drafts', () => {
     expect(takeSessionDraft(null).text).toBe('new chat draft')
     expect(takeSessionDraft(undefined).text).toBe('new chat draft')
     expect(takeSessionDraft('session-a').text).toBe('session draft')
+  })
+
+  it('isolates unsaved new-session drafts by profile', () => {
+    $activeGatewayProfile.set('client-a')
+    stashSessionDraft(null, 'client a draft', [])
+    $activeGatewayProfile.set('client-b')
+    stashSessionDraft(null, 'client b draft', [])
+
+    expect(takeSessionDraft(null).text).toBe('client b draft')
+    $activeGatewayProfile.set('client-a')
+    expect(takeSessionDraft(null).text).toBe('client a draft')
+
+    clearSessionDraft(null)
+    $activeGatewayProfile.set('client-b')
+    clearSessionDraft(null)
+    $activeGatewayProfile.set('default')
+  })
+
+  it('removes a conflicting legacy fresh draft without replacing the default profile draft', () => {
+    const drafts = new Map([
+      ['__new__', { attachments: [], text: 'stale legacy text' }],
+      ['__new__:default', { attachments: [], text: 'current default text' }]
+    ])
+
+    expect(migrateLegacyNewSessionDraft(drafts)).toBe(true)
+    expect(drafts.has('__new__')).toBe(false)
+    expect(drafts.get('__new__:default')?.text).toBe('current default text')
   })
 
   it('persists draft text (not attachments) to localStorage', () => {

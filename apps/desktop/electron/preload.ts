@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // window; `onChanged` keeps every window's toggle truthful.
   hud: {
     open: request => ipcRenderer.invoke('hermes:hud:open', request),
+    getState: () => ipcRenderer.invoke('hermes:hud:get-state'),
     close: () => ipcRenderer.invoke('hermes:hud:close'),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
     moveBy: delta => ipcRenderer.send('hermes:hud:move-by', delta),

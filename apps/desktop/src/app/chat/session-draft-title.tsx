@@ -1,6 +1,9 @@
+import { useStore } from '@nanostores/react'
+
 import { NEW_SESSION_TITLE } from '@/lib/chat-runtime'
 import { useStoreSelector } from '@/lib/use-session-slice'
-import { $draftTitles, draftTitleIn } from '@/store/composer'
+import { $draftTitles, draftTitleIn, newSessionDraftScope } from '@/store/composer'
+import { $activeGatewayProfile } from '@/store/profile'
 
 export interface SessionDraftTitleProps {
   /** The draft's composer key — a tile's stored session id, or null for the
@@ -21,5 +24,8 @@ export interface SessionDraftTitleProps {
  * reads the same as one never typed into.
  */
 export function SessionDraftTitle({ scope }: SessionDraftTitleProps) {
-  return useStoreSelector($draftTitles, titles => draftTitleIn(titles, scope)) || NEW_SESSION_TITLE
+  const activeProfile = useStore($activeGatewayProfile)
+  const resolvedScope = scope ?? newSessionDraftScope(activeProfile)
+
+  return useStoreSelector($draftTitles, titles => draftTitleIn(titles, resolvedScope)) || NEW_SESSION_TITLE
 }

@@ -19,9 +19,10 @@ import { useEffect, useRef } from 'react'
 
 import { reloadPersistedDrafts, requestComposerDraftSync } from '@/store/composer'
 import { reportHudSession, watchHudState } from '@/store/hud'
+import { ensureGatewayAgent } from '@/store/profile'
 import { $selectedStoredSessionId } from '@/store/session'
 import { focusOpenSession, sessionTileDelegate } from '@/store/session-states'
-import { isHudWindow } from '@/store/windows'
+import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
 
 import { getActiveComposer } from '../chat/composer/focus'
 import { openSession, type OpenSessionNavigate } from '../open-session'
@@ -60,47 +61,56 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
   paramsRef.current = { navigate, resumeSession }
 
   useEffect(() => {
-    // The HUD's own renderer mounts the same wiring; it is the window going
-    // away, so it has nothing to re-home.
-    if (isHudWindow()) {
+    // Only the primary renderer owns the re-home transaction. HUD and secondary
+    // session windows receive the broadcast too, but must never race the primary
+    // for the session's single gateway transport.
+    if (isAuxiliaryWindow()) {
       return
     }
 
-    return watchHudState(hudSessionId => {
-      // The HUD may have typed or sent since this window last read the stash.
-      reloadPersistedDrafts()
+    return watchHudState(({ isCurrent, profile, sessionId: hudSessionId }) => {
+      void (async () => {
+        await ensureGatewayAgent(null, profile)
 
-      const selected = $selectedStoredSessionId.get()
-      const target = hudSessionId ?? selected
+        if (!isCurrent()) {
+          return
+        }
 
-      // Somewhere other than the workspace pane. If it is an open tile, front
-      // it and re-resume THROUGH the tile delegate: the ordinary resume path
-      // enforces "a session is either main or a tile, never both" and would
-      // close the tile to take it into main, quietly rearranging tabs the user
-      // opened on purpose. Otherwise it's a session this window has never seen
-      // — route to it and let the route resume do the rest, including loading
-      // its draft as the composer's scope swaps.
-      if (target && target !== selected) {
-        const delegate = focusOpenSession(target) === 'tile' ? sessionTileDelegate() : null
+        // The HUD may have typed or sent since this window last read the stash.
+        reloadPersistedDrafts()
 
-        if (delegate) {
-          void delegate.resumeTile(target).catch(() => undefined)
+        const selected = $selectedStoredSessionId.get()
+        const target = hudSessionId ?? selected
+
+        // Somewhere other than the workspace pane. If it is an open tile, front
+        // it and re-resume THROUGH the tile delegate: the ordinary resume path
+        // enforces "a session is either main or a tile, never both" and would
+        // close the tile to take it into main, quietly rearranging tabs the user
+        // opened on purpose. Otherwise it's a session this window has never seen
+        // — route to it and let the route resume do the rest, including loading
+        // its draft as the composer's scope swaps.
+        if (target && target !== selected) {
+          const delegate = focusOpenSession(target) === 'tile' ? sessionTileDelegate() : null
+
+          if (delegate) {
+            void delegate.resumeTile(target).catch(() => undefined)
+
+            return
+          }
+
+          openSession(target, paramsRef.current.navigate)
 
           return
         }
 
-        openSession(target, paramsRef.current.navigate)
+        // Same session, so the composer's scope never changes and its
+        // per-session swap effect will never re-consult the stash. Repaint it.
+        requestComposerDraftSync('reload')
 
-        return
-      }
-
-      // Same session, so the composer's scope never changes and its
-      // per-session swap effect will never re-consult the stash. Repaint it.
-      requestComposerDraftSync('reload')
-
-      if (target) {
-        void paramsRef.current.resumeSession(target)
-      }
+        if (target) {
+          await paramsRef.current.resumeSession(target)
+        }
+      })().catch(() => undefined)
     })
   }, [])
 }

@@ -38,6 +38,11 @@ class HandlerRegistry:
         fn._hermes_profile_scoped = True
         return fn
 
+    def profile_mutation_locked(self, fn):
+        """Mark a profile RPC to hold its lifecycle lock for the full call."""
+        fn._hermes_profile_mutation_locked = True
+        return fn
+
     def install(self, server) -> None:
         """Rebind pending handlers onto ``server``'s globals and register them."""
         g = vars(server)
@@ -48,6 +53,19 @@ class HandlerRegistry:
             real.__kwdefaults__ = fn.__kwdefaults__
             real.__doc__ = fn.__doc__
             real.__dict__.update(fn.__dict__)
+            if getattr(fn, "_hermes_profile_mutation_locked", False):
+                unlocked = real
+
+                def locked(rid, params, _fn=unlocked):
+                    name = str(params.get("name") or "").strip()
+                    if not name:
+                        return _fn(rid, params)
+                    from hermes_cli.profiles import profile_mutation_lock
+
+                    with profile_mutation_lock(name):
+                        return _fn(rid, params)
+
+                real = locked
             if getattr(fn, "_hermes_profile_scoped", False):
                 real = server._profile_scoped(real)
             server._methods[name] = real

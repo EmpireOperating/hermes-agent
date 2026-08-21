@@ -3,6 +3,7 @@ import { useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { clearSessionDraft, type ComposerAttachment, mainComposerScope, stashSessionDraft } from '@/store/composer'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import { useComposerActions } from '../../hooks/use-composer-actions'
@@ -56,6 +57,11 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
     mainComposerScope.clear()
     clearSessionDraft('session-A')
     clearSessionDraft('session-B')
+    $activeGatewayProfile.set('default')
+    clearSessionDraft(null)
+    $activeGatewayProfile.set('client-b')
+    clearSessionDraft(null)
+    $activeGatewayProfile.set('default')
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
     vi.unstubAllGlobals()
     $connection.set(null)
@@ -90,6 +96,21 @@ describe('useComposerDraft — attachment scope stays coherent with the committe
     // By the layout phase the scope must already be B's (empty) — a submit
     // fired the instant B renders must never ship session A's attachment.
     expect(snapshots[0]).toEqual([])
+  })
+
+  it('switches a fresh composer draft when the active profile changes', () => {
+    $activeGatewayProfile.set('default')
+    stashSessionDraft(null, 'default private draft', [])
+    $activeGatewayProfile.set('client-b')
+    stashSessionDraft(null, 'client b draft', [])
+    $activeGatewayProfile.set('default')
+    mockComposerApi.setText.mockClear()
+
+    render(<ProbeHarness activeQueueSessionKey={null} onLayoutSnapshot={() => undefined} sessionId="" />)
+    expect(mockComposerApi.setText).toHaveBeenLastCalledWith('default private draft')
+
+    act(() => $activeGatewayProfile.set('client-b'))
+    expect(mockComposerApi.setText).toHaveBeenLastCalledWith('client b draft')
   })
 
   it('applies a delayed image preview when it resolves while its attachment draft is inactive', async () => {
