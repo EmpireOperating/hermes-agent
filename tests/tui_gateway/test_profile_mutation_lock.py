@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -102,3 +103,46 @@ def test_registry_composes_mutation_lock_with_profile_scope(home):
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert result == {"value": True}
+
+
+def test_tui_profile_identity_is_created_listed_and_guards_metadata(home):
+    created = srv._methods["profiles.create"](
+        "create",
+        {
+            "name": "care-instance",
+            "no_skills": True,
+            "mirror_credentials": False,
+        },
+    )["result"]
+
+    assert created["instance_written"] is True
+    instance_id = created["instance_id"]
+    assert len(instance_id) == 32
+    assert all(char in "0123456789abcdef" for char in instance_id)
+
+    wrong = srv._methods["profiles.configure"](
+        "wrong",
+        {
+            "name": "care-instance",
+            "expected_instance_id": "f" * 32,
+            "ui_meta": {"empire_care": {"schema": 1, "display_name": "Wrong"}},
+        },
+    )["result"]
+    correct = srv._methods["profiles.configure"](
+        "correct",
+        {
+            "name": "care-instance",
+            "expected_instance_id": instance_id,
+            "ui_meta": {"empire_care": {"schema": 1, "display_name": "Correct"}},
+        },
+    )["result"]
+    inventory = srv._methods["profiles.list"](
+        "list", {"include_sessions": False},
+    )["result"]
+    row = next(item for item in inventory["profiles"] if item["name"] == "care-instance")
+
+    assert wrong["applied"]["ui_meta"] is False
+    assert correct["applied"]["ui_meta"] is True
+    assert row["instance_id"] == instance_id
+    assert row["ui_meta"]["empire_care"]["display_name"] == "Correct"
+    assert Path(created["path"]).is_dir()

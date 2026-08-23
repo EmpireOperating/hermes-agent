@@ -226,5 +226,23 @@ def test_lifecycle_operations_wait_for_external_lock_and_leave_valid_state(profi
     assert profiles.get_profile_dir("newname").is_dir()
 
 
+def test_create_profile_can_return_and_persist_unique_lifecycle_identity(profile_env):
+    first_path, first_id = profiles.create_profile(
+        "care-instance-one", no_alias=True, no_skills=True, return_instance=True,
+    )
+    second_path, second_id = profiles.create_profile(
+        "care-instance-two", no_alias=True, no_skills=True, return_instance=True,
+    )
+
+    import yaml
+
+    assert len(first_id) == 32
+    assert all(char in "0123456789abcdef" for char in first_id)
+    assert first_id != second_id
+    assert yaml.safe_load((first_path / "profile.yaml").read_text())["instance_id"] == first_id
+    assert yaml.safe_load((second_path / "profile.yaml").read_text())["instance_id"] == second_id
+    assert isinstance(profiles.create_profile("care-path-only", no_alias=True, no_skills=True), Path)
+
+
 def test_default_profile_display_rename_keeps_its_existing_name_rules(profile_env):
     assert profiles.rename_profile("default", "My Workspace") == profile_env

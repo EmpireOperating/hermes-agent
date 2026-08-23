@@ -248,6 +248,10 @@ def _(rid, params: dict) -> dict:
                 if meta_path.is_file():
                     with open(meta_path, "r", encoding="utf-8") as f:
                         raw_meta = _yaml.safe_load(f) or {}
+                    instance_id = raw_meta.get("instance_id")
+                    if isinstance(instance_id, str) and len(instance_id) == 32 \
+                        and all(char in "0123456789abcdef" for char in instance_id):
+                        row["instance_id"] = instance_id
                     ui_meta = raw_meta.get("ui_meta")
                     if isinstance(ui_meta, dict) and ui_meta:
                         row["ui_meta"] = ui_meta
@@ -326,14 +330,19 @@ def _(rid, params: dict) -> dict:
 
         clone_from = str(params.get("clone_from") or "").strip() or None
         clone_all = is_truthy_value(params.get("clone_all", False))
-        path = profiles_mod.create_profile(
+        created = profiles_mod.create_profile(
             name=name,
             clone_from=clone_from,
             clone_all=clone_all,
             clone_config=bool(clone_from) and not clone_all,
             no_skills=is_truthy_value(params.get("no_skills", False)),
             description=str(params.get("description") or "").strip() or None,
+            return_instance=True,
         )
+        if not isinstance(created, tuple):
+            raise RuntimeError("profile instance identity unavailable")
+        path, instance_id = created
+        instance_written = True
     except (ValueError, FileExistsError, FileNotFoundError) as e:
         return _err(rid, 4062, str(e))
     except Exception as e:
@@ -516,6 +525,8 @@ def _(rid, params: dict) -> dict:
             "ok": True,
             "name": name,
             "path": str(path),
+            "instance_id": instance_id,
+            "instance_written": instance_written,
             "soul_written": soul_written,
             "model_set": model_set,
             "mirrored": mirrored,
@@ -756,6 +767,15 @@ def _(rid, params: dict) -> dict:
                                     existing = loaded
                             except Exception:
                                 existing = {}
+
+                        expected_instance_id = params.get("expected_instance_id")
+                        if expected_instance_id is not None and (
+                            not isinstance(expected_instance_id, str)
+                            or len(expected_instance_id) != 32
+                            or any(char not in "0123456789abcdef" for char in expected_instance_id)
+                            or existing.get("instance_id") != expected_instance_id
+                        ):
+                            raise ValueError("profile instance mismatch")
 
                         raw_revisions = existing.get("_ui_meta_revisions")
                         revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}

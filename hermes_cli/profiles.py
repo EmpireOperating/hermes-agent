@@ -1283,7 +1283,8 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
-) -> Path:
+    return_instance: bool = False,
+) -> Path | tuple[Path, str]:
     """Create a new profile directory.
 
     Parameters
@@ -1305,11 +1306,15 @@ def create_profile(
         a marker file so ``hermes update`` skips re-seeding this profile's
         skills. Mutually exclusive with ``clone_config``/``clone_all`` (those
         explicitly copy skills from the source).
+    return_instance:
+        Return ``(path, instance_id)`` instead of only the path. Every created
+        profile receives a fresh lifecycle identity regardless.
 
     Returns
     -------
-    Path
-        The newly created profile directory.
+    Path | tuple[Path, str]
+        The newly created profile directory, optionally paired with its fresh
+        lifecycle instance identity.
     """
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
@@ -1457,6 +1462,27 @@ def create_profile(
         except Exception:
             pass  # non-fatal — user can describe later with `hermes profile describe`
 
+    # Assign a fresh lifecycle identity while the external profile-name lock is
+    # still held. Clones never retain the source instance identity.
+    import uuid
+
+    import yaml
+    from utils import atomic_yaml_write
+
+    meta_path = profile_dir / "profile.yaml"
+    existing_meta = {}
+    if meta_path.is_file():
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                loaded_meta = yaml.safe_load(f) or {}
+            if isinstance(loaded_meta, dict):
+                existing_meta = loaded_meta
+        except Exception:
+            existing_meta = {}
+    instance_id = uuid.uuid4().hex
+    existing_meta["instance_id"] = instance_id
+    atomic_yaml_write(meta_path, existing_meta, sort_keys=False)
+
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so
     # `hermes -p <profile> gateway start` can supervise it via
@@ -1465,7 +1491,7 @@ def create_profile(
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
 
-    return profile_dir
+    return (profile_dir, instance_id) if return_instance else profile_dir
 
 
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
