@@ -28,8 +28,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
@@ -39,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
+_PROFILE_MUTATION_LOCAL = threading.local()
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -301,6 +306,121 @@ def _get_active_profile_path() -> Path:
 def _get_wrapper_dir() -> Path:
     """Return the directory for wrapper scripts."""
     return Path.home() / ".local" / "bin"
+
+
+@contextmanager
+def profile_mutation_lock(*names: str):
+    """Serialize lifecycle mutations for one or more canonical profiles.
+
+    Locks are anchored under the default Hermes home, never in a profile
+    directory that a concurrent delete could remove.  The thread-local depth
+    map makes nested lifecycle calls reentrant while the OS lock coordinates
+    independent threads and processes.
+    """
+    canonical = sorted({normalize_profile_name(name) for name in names})
+    for name in canonical:
+        validate_profile_name(name)
+
+    lock_root = _get_default_hermes_home() / ".profile-locks"
+    lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(lock_root, 0o700)
+
+    held = getattr(_PROFILE_MUTATION_LOCAL, "held", None)
+    if held is None:
+        held = {}
+        _PROFILE_MUTATION_LOCAL.held = held
+
+    handles = []
+    depths_incremented = False
+    try:
+        for name in canonical:
+            if held.get(name, 0):
+                continue
+            path = lock_root / f"{name}.lock"
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            handle = os.fdopen(fd, "r+b")
+            try:
+                if os.name != "nt":
+                    os.chmod(path, 0o600)
+                handle.seek(0)
+                if handle.read() != b"\0":
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                handle.close()
+                raise
+            handles.append(handle)
+
+        for name in canonical:
+            held[name] = held.get(name, 0) + 1
+        depths_incremented = True
+        yield
+    finally:
+        if depths_incremented:
+            for name in canonical:
+                depth = held.get(name, 0) - 1
+                if depth > 0:
+                    held[name] = depth
+                else:
+                    held.pop(name, None)
+        for handle in reversed(handles):
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _locked_profile_mutation(*name_fields: str, name_resolver=None):
+    """Decorate a lifecycle operation with locks for its profile arguments."""
+    def decorate(func):
+        func_signature = signature(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            bound = func_signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            if name_resolver is not None:
+                names = name_resolver(bound.arguments)
+            else:
+                names = [str(bound.arguments[field]) for field in name_fields]
+            with profile_mutation_lock(*names):
+                return func(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def _rename_profile_lock_names(arguments) -> list[str]:
+    """Return the identities renamed by ``rename_profile``.
+
+    ``default`` has a presentation-only rename, so its display label is not a
+    profile id and must never be used as a lock filename.
+    """
+    old_name = str(arguments["old_name"])
+    if normalize_profile_name(old_name) == "default":
+        return [old_name]
+    return [old_name, str(arguments["new_name"])]
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1211,7 @@ def profiles_to_serve(
     return serve
 
 
+@_locked_profile_mutation("name")
 def create_profile(
     name: str,
     clone_from: Optional[str] = None,
@@ -1593,6 +1714,7 @@ def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
         raise last_exc
 
 
+@_locked_profile_mutation("name")
 def delete_profile(name: str, yes: bool = False) -> Path:
     """Delete a profile, its wrapper script, and its gateway service.
 
@@ -2404,6 +2526,7 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         print(f"✓ Honcho host updated: {source_host} → {new_host}")
 
 
+@_locked_profile_mutation(name_resolver=_rename_profile_lock_names)
 def rename_profile(old_name: str, new_name: str) -> Path:
     """Rename a profile: directory, wrapper script, service, active_profile.
 

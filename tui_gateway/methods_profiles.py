@@ -17,6 +17,7 @@ from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
 method = _registry.method
+profile_mutation_locked = _registry.profile_mutation_locked
 
 
 @method("profiles.list")
@@ -283,6 +284,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("profiles.create")
+@profile_mutation_locked
 def _(rid, params: dict) -> dict:
     """Create a profile — the ws twin of POST /api/profiles.
 
@@ -693,6 +695,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("profiles.configure")
+@profile_mutation_locked
 def _(rid, params: dict) -> dict:
     """Apply configuration changes to a profile (editor Save).
 

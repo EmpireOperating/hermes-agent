@@ -1,0 +1,91 @@
+"""TUI profile mutations share the public lifecycle lock."""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+import tui_gateway.server as srv
+
+
+@pytest.fixture()
+def home(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    return hermes_home
+
+
+def test_configure_waits_for_external_profile_mutation_lock(home):
+    from hermes_cli.profiles import profile_mutation_lock
+
+    done = threading.Event()
+    response = {}
+
+    def configure():
+        response.update(
+            srv._methods["profiles.configure"](
+                "configure",
+                {"name": "default", "ui_meta": {"test-lock": {"ready": True}}},
+            )
+        )
+        done.set()
+
+    with profile_mutation_lock("default"):
+        thread = threading.Thread(target=configure)
+        thread.start()
+        assert not done.wait(0.2)
+
+    assert done.wait(2)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert response["result"]["applied"]["ui_meta"] is True
+
+
+def test_configure_missing_name_preserves_its_error_response(home):
+    response = srv._methods["profiles.configure"]("configure", {})
+
+    assert response["error"] == {"code": 4063, "message": "name required"}
+
+
+def test_registry_composes_mutation_lock_with_profile_scope(home):
+    from hermes_cli.profiles import profile_mutation_lock
+    from tui_gateway.method_ctx import HandlerRegistry
+
+    registry = HandlerRegistry()
+
+    @registry.method("profiles.test")
+    @registry.profile_scoped
+    @registry.profile_mutation_locked
+    def handler(_rid, params):
+        return params["scoped"]
+
+    def profile_scoped(fn):
+        def wrapped(rid, params):
+            scoped_params = dict(params)
+            scoped_params["scoped"] = True
+            return fn(rid, scoped_params)
+
+        return wrapped
+
+    server = SimpleNamespace(_methods={}, _profile_scoped=profile_scoped)
+    registry.install(server)
+
+    result = {}
+    done = threading.Event()
+
+    def call_handler():
+        result["value"] = server._methods["profiles.test"]("test", {"name": "default"})
+        done.set()
+
+    with profile_mutation_lock("default"):
+        thread = threading.Thread(target=call_handler)
+        thread.start()
+        assert not done.wait(0.2)
+
+    assert done.wait(2)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert result == {"value": True}
