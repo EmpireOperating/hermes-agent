@@ -60,9 +60,18 @@ class HandlerRegistry:
                     name = str(params.get("name") or "").strip()
                     if not name:
                         return _fn(rid, params)
-                    from hermes_cli.profiles import profile_mutation_lock
+                    from hermes_cli.profiles import (
+                        normalize_profile_name,
+                        profile_mutation_lock,
+                        validate_profile_name,
+                    )
 
-                    with profile_mutation_lock(name):
+                    try:
+                        canonical = normalize_profile_name(name)
+                        validate_profile_name(canonical)
+                    except (TypeError, ValueError):
+                        return _fn(rid, params)
+                    with profile_mutation_lock(canonical):
                         return _fn(rid, params)
 
                 real = locked

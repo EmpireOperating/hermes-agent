@@ -44,6 +44,19 @@ def test_configure_waits_for_external_profile_mutation_lock(home):
     assert response["result"]["applied"]["ui_meta"] is True
 
 
+@pytest.mark.parametrize(
+    ("method", "expected_code"),
+    [("profiles.create", 4062), ("profiles.configure", 4064)],
+)
+def test_invalid_name_preserves_structured_error_and_creates_no_lock_artifact(
+    home, method, expected_code,
+):
+    response = srv._methods[method]("invalid", {"name": "../../bad"})
+
+    assert response["error"]["code"] == expected_code
+    assert not (home / ".profile-locks").exists()
+
+
 def test_configure_missing_name_preserves_its_error_response(home):
     response = srv._methods["profiles.configure"]("configure", {})
 

@@ -308,6 +308,14 @@ def _get_wrapper_dir() -> Path:
     return Path.home() / ".local" / "bin"
 
 
+def _validate_profile_lock_entry(info, *, directory: bool) -> None:
+    reparse = bool(getattr(info, "st_file_attributes", 0) & 0x400)
+    expected_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    owner_ok = not hasattr(os, "getuid") or info.st_uid == os.getuid()
+    if stat.S_ISLNK(info.st_mode) or reparse or not expected_type or not owner_ok:
+        raise ValueError("unsafe profile lock path")
+
+
 @contextmanager
 def profile_mutation_lock(*names: str):
     """Serialize lifecycle mutations for one or more canonical profiles.
@@ -320,11 +328,36 @@ def profile_mutation_lock(*names: str):
     canonical = sorted({normalize_profile_name(name) for name in names})
     for name in canonical:
         validate_profile_name(name)
+    if not canonical:
+        yield
+        return
 
     lock_root = _get_default_hermes_home() / ".profile-locks"
-    lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_info = lock_root.lstat()
+    except OSError:
+        raise ValueError("unsafe profile lock path") from None
+    _validate_profile_lock_entry(root_info, directory=True)
     if os.name != "nt":
-        os.chmod(lock_root, 0o700)
+        os.chmod(lock_root, 0o700, follow_symlinks=False)
+
+    root_fd = None
+    if os.name != "nt":
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_fd = os.open(lock_root, flags)
+            _validate_profile_lock_entry(os.fstat(root_fd), directory=True)
+        except OSError:
+            if root_fd is not None:
+                os.close(root_fd)
+            raise ValueError("unsafe profile lock path") from None
+        except ValueError:
+            if root_fd is not None:
+                os.close(root_fd)
+            raise
 
     held = getattr(_PROFILE_MUTATION_LOCAL, "held", None)
     if held is None:
@@ -338,29 +371,57 @@ def profile_mutation_lock(*names: str):
             if held.get(name, 0):
                 continue
             path = lock_root / f"{name}.lock"
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-            handle = os.fdopen(fd, "r+b")
             try:
+                existing = path.lstat()
+            except FileNotFoundError:
+                existing = None
+            except OSError:
+                raise ValueError("unsafe profile lock path") from None
+            if existing is not None:
+                _validate_profile_lock_entry(existing, directory=False)
+
+            flags = os.O_RDWR | os.O_CREAT
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            handle = None
+            try:
+                if root_fd is not None:
+                    fd = os.open(f"{name}.lock", flags, 0o600, dir_fd=root_fd)
+                else:
+                    fd = os.open(path, flags, 0o600)
+            except OSError:
+                raise ValueError("unsafe profile lock path") from None
+            try:
+                info = os.fstat(fd)
+                _validate_profile_lock_entry(info, directory=False)
                 if os.name != "nt":
-                    os.chmod(path, 0o600)
-                handle.seek(0)
-                if handle.read() != b"\0":
-                    handle.seek(0)
-                    handle.truncate()
-                    handle.write(b"\0")
-                    handle.flush()
+                    os.fchmod(fd, 0o600)
+                handle = os.fdopen(fd, "r+b")
+                fd = -1
                 handle.seek(0)
                 if os.name == "nt":
                     import msvcrt
 
+                    if info.st_size == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                        handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 else:
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    if info.st_size == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                        handle.seek(0)
             except Exception:
-                handle.close()
+                if fd >= 0:
+                    os.close(fd)
+                elif handle is not None:
+                    handle.close()
                 raise
+            if handle is None:
+                raise ValueError("unsafe profile lock path")
             handles.append(handle)
 
         for name in canonical:
@@ -388,6 +449,8 @@ def profile_mutation_lock(*names: str):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 handle.close()
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def _locked_profile_mutation(*name_fields: str, name_resolver=None):

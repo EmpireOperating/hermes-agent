@@ -35,6 +35,54 @@ def test_invalid_name_never_creates_an_escaped_lock_file(profile_env):
     assert not (profile_env / ".profile-locks").exists()
 
 
+def test_symlinked_lock_file_is_rejected_without_clobbering_target(
+    profile_env, tmp_path,
+):
+    if os.name == "nt":
+        pytest.skip("POSIX symlink/no-follow contract")
+    root = profile_env / ".profile-locks"
+    root.mkdir(mode=0o700)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"UNCHANGED-SENTINEL")
+    (root / "worker.lock").symlink_to(victim)
+
+    with pytest.raises(ValueError, match="unsafe profile lock"):
+        with profiles.profile_mutation_lock("worker"):
+            pass
+
+    assert victim.read_bytes() == b"UNCHANGED-SENTINEL"
+
+
+def test_symlinked_lock_root_is_rejected_without_creating_lock(
+    profile_env, tmp_path,
+):
+    if os.name == "nt":
+        pytest.skip("POSIX symlink/no-follow contract")
+    target = tmp_path / "redirected-locks"
+    target.mkdir()
+    (profile_env / ".profile-locks").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe profile lock"):
+        with profiles.profile_mutation_lock("worker"):
+            pass
+
+    assert list(target.iterdir()) == []
+
+
+def test_existing_regular_lock_contents_are_not_clobbered(profile_env):
+    root = profile_env / ".profile-locks"
+    root.mkdir(mode=0o700)
+    lock_file = root / "worker.lock"
+    lock_file.write_bytes(b"UNCHANGED-LOCK")
+    if os.name != "nt":
+        lock_file.chmod(0o600)
+
+    with profiles.profile_mutation_lock("worker"):
+        pass
+
+    assert lock_file.read_bytes() == b"UNCHANGED-LOCK"
+
+
 def test_lock_root_and_file_are_owner_only(profile_env):
     with profiles.profile_mutation_lock("worker"):
         lock_root = profile_env / ".profile-locks"
